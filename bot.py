@@ -1,7 +1,7 @@
 import asyncio
 import os
 import logging
-import hashlib
+import re
 import feedparser
 import telegram
 from datetime import datetime
@@ -14,53 +14,71 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Config from Environment Variables ───────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 def require_env(key):
     val = os.environ.get(key)
     if not val:
         raise EnvironmentError(f"❌ Missing env var: {key}")
     return val
 
-TELEGRAM_BOT_TOKEN  = require_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID    = require_env("TELEGRAM_CHAT_ID")
-TWITTER_USERNAMES   = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
-POLL_INTERVAL       = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
-INCLUDE_RETWEETS    = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
-CUSTOM_PREFIX       = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
+TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID   = require_env("TELEGRAM_CHAT_ID")
+TWITTER_USERNAMES  = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
+POLL_INTERVAL      = int(os.environ.get("POLL_INTERVAL_SECONDS", "120"))
+INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
+CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
 
-# RSSHub public instance — ya apna self-host kar sakte ho
-RSSHUB_BASE = os.environ.get("RSSHUB_BASE", "https://rsshub.app")
+# Multiple Nitter instances — tries each until one works
+NITTER_INSTANCES = [
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
+    "https://nitter.net",
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks",
+]
 
-# ─── Seen tweets (in-memory) ─────────────────────────────────────────────────
+# ─── State ────────────────────────────────────────────────────────────────────
 seen_ids: set = set()
 
-# ─── RSS Feed Fetch ───────────────────────────────────────────────────────────
-def get_rss_url(username: str) -> str:
-    return f"{RSSHUB_BASE}/twitter/user/{username}"
-
+# ─── RSS Fetch with Fallback ──────────────────────────────────────────────────
 def fetch_tweets(username: str):
-    url = get_rss_url(username)
-    feed = feedparser.parse(url)
-    if feed.bozo and not feed.entries:
-        raise Exception(f"RSS fetch failed for @{username}: {feed.bozo_exception}")
-    return feed.entries
+    last_error = None
+    for instance in NITTER_INSTANCES:
+        url = f"{instance}/{username}/rss"
+        try:
+            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            # Validate it's actually an RSS feed
+            if feed.entries and feed.feed.get("title"):
+                log.info(f"✓ Using {instance} for @{username}")
+                return feed.entries
+            elif feed.bozo:
+                last_error = str(feed.bozo_exception)
+                continue
+            else:
+                last_error = "Empty feed"
+                continue
+        except Exception as e:
+            last_error = str(e)
+            continue
+
+    raise Exception(f"All Nitter instances failed for @{username}. Last error: {last_error}")
 
 # ─── Format Message ───────────────────────────────────────────────────────────
 def format_message(entry, username: str) -> str:
-    title = entry.get("title", "")
-    link  = entry.get("link", f"https://twitter.com/{username}")
-    published = entry.get("published", "")
-
-    # Clean up summary (remove HTML tags roughly)
-    summary = entry.get("summary", title)
-    import re
+    # Clean HTML tags from summary
+    summary = entry.get("summary", entry.get("title", ""))
     summary = re.sub(r"<[^>]+>", "", summary).strip()
+    summary = summary.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+
+    # Build original Twitter link (not nitter)
+    link = entry.get("link", "")
+    link = re.sub(r"https?://[^/]+/", "https://twitter.com/", link)
 
     try:
         dt = datetime(*entry.published_parsed[:6])
         timestamp = dt.strftime("%d %b %Y, %I:%M %p UTC")
     except:
-        timestamp = published
+        timestamp = entry.get("published", "")
 
     return (
         f"{CUSTOM_PREFIX}\n\n"
@@ -86,22 +104,22 @@ async def send_to_telegram(message: str):
 
 # ─── Main Loop ────────────────────────────────────────────────────────────────
 async def run():
-    log.info("🚀 Twitter → Telegram Bot started (RSS mode)")
+    log.info("🚀 Twitter → Telegram Bot started (Nitter RSS mode)")
     log.info(f"📋 Monitoring: {', '.join(TWITTER_USERNAMES)}")
     log.info(f"⏱  Poll every {POLL_INTERVAL}s")
 
-    # First run — seed seen_ids without sending (avoid flood on startup)
-    log.info("🌱 Seeding existing tweets (won't send old ones)...")
+    # Seed — don't send old tweets on startup
+    log.info("🌱 Seeding existing tweets...")
     for username in TWITTER_USERNAMES:
         try:
             entries = fetch_tweets(username)
-            for entry in entries:
-                seen_ids.add(entry.get("id") or entry.get("link"))
-            log.info(f"✓ @{username} — seeded {len(entries)} tweets")
-        except Exception as e:
-            log.warning(f"⚠️ Could not seed @{username}: {e}")
+            for e in entries:
+                seen_ids.add(e.get("id") or e.get("link"))
+            log.info(f"✓ @{username} seeded {len(entries)} tweets")
+        except Exception as ex:
+            log.warning(f"⚠️ Seed failed @{username}: {ex}")
 
-    log.info("✅ Seeding done. Now watching for NEW tweets...\n")
+    log.info("✅ Watching for NEW tweets...\n")
 
     while True:
         for username in TWITTER_USERNAMES:
@@ -109,17 +127,13 @@ async def run():
                 entries = fetch_tweets(username)
                 new_count = 0
 
-                for entry in reversed(entries):  # oldest first
+                for entry in reversed(entries):
                     uid = entry.get("id") or entry.get("link")
                     if uid in seen_ids:
                         continue
 
                     title = entry.get("title", "")
-
-                    # Filter retweets
-                    if not INCLUDE_RETWEETS and (
-                        title.lower().startswith("rt @") or "RT @" in title
-                    ):
+                    if not INCLUDE_RETWEETS and "RT by" in title:
                         seen_ids.add(uid)
                         continue
 
@@ -129,10 +143,7 @@ async def run():
                     new_count += 1
                     await asyncio.sleep(1)
 
-                if new_count:
-                    log.info(f"📨 @{username}: {new_count} new tweet(s) sent")
-                else:
-                    log.info(f"😴 @{username}: no new tweets")
+                log.info(f"@{username}: {new_count} new tweet(s)" if new_count else f"@{username}: no new tweets")
 
             except Exception as e:
                 log.error(f"Error (@{username}): {e}")
