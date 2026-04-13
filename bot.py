@@ -121,35 +121,33 @@ async def run():
 
     log.info("✅ Watching for NEW tweets...\n")
 
-    while True:
-        for username in TWITTER_USERNAMES:
-            try:
-                entries = fetch_tweets(username)
-                new_count = 0
-
-                for entry in reversed(entries):
-                    uid = entry.get("id") or entry.get("link")
-                    if uid in seen_ids:
-                        continue
-
-                    title = entry.get("title", "")
-                    if not INCLUDE_RETWEETS and "RT by" in title:
-                        seen_ids.add(uid)
-                        continue
-
-                    msg = format_message(entry, username)
-                    await send_to_telegram(msg)
+    async def check_user(username: str):
+        try:
+            entries = fetch_tweets(username)
+            new_count = 0
+            for entry in reversed(entries):
+                uid = entry.get("id") or entry.get("link")
+                if uid in seen_ids:
+                    continue
+                title = entry.get("title", "")
+                if not INCLUDE_RETWEETS and "RT by" in title:
                     seen_ids.add(uid)
-                    new_count += 1
-                    await asyncio.sleep(1)
+                    continue
+                msg = format_message(entry, username)
+                await send_to_telegram(msg)
+                seen_ids.add(uid)
+                new_count += 1
+                await asyncio.sleep(0.5)
+            log.info(f"@{username}: {new_count} new tweet(s)" if new_count else f"@{username}: no new tweets")
+        except Exception as e:
+            log.error(f"Error (@{username}): {e}")
 
-                log.info(f"@{username}: {new_count} new tweet(s)" if new_count else f"@{username}: no new tweets")
-
-            except Exception as e:
-                log.error(f"Error (@{username}): {e}")
-
-        log.info(f"💤 Sleeping {POLL_INTERVAL}s...")
-        await asyncio.sleep(POLL_INTERVAL)
+    while True:
+        # Check ALL accounts simultaneously in parallel!
+        await asyncio.gather(*[check_user(u) for u in TWITTER_USERNAMES])
+        if POLL_INTERVAL > 0:
+            log.info(f"💤 Sleeping {POLL_INTERVAL}s...")
+            await asyncio.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
     asyncio.run(run())
