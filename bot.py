@@ -52,24 +52,87 @@ async def fetch_tweets(username: str):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _fetch_sync, username)
 
-def format_message(entry, username: str) -> str:
+def extract_image(html: str) -> str | None:
+    """Extract first image URL from HTML content"""
+    # Try to find img tags
+    match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
+    if match:
+        img_url = match.group(1)
+        # Convert nitter image proxy URL to original twitter/pbs.twimg.com URL
+        # Nitter proxies images like: /pic/media%2F...
+        if img_url.startswith("/pic/"):
+            # Extract the encoded part
+            encoded = img_url[5:]  # Remove /pic/
+            import urllib.parse
+            decoded = urllib.parse.unquote(encoded)
+            if not decoded.startswith("http"):
+                decoded = "https://pbs.twimg.com/" + decoded
+            return decoded
+        elif img_url.startswith("http"):
+            return img_url
+    return None
+
+def format_caption(entry, username: str) -> str:
+    """Format tweet text as Telegram caption"""
     summary = entry.get("summary", entry.get("title", ""))
-    summary = re.sub(r"<[^>]+>", "", summary).strip()
-    summary = summary.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    
+    # Remove img tags but keep text
+    summary = re.sub(r'<img[^>]+>', '', summary)
+    # Remove all other HTML tags
+    summary = re.sub(r'<[^>]+>', '', summary).strip()
+    # Fix HTML entities
+    summary = summary.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    # Clean up extra whitespace/newlines
+    summary = re.sub(r'\n{3,}', '\n\n', summary).strip()
+
     link = entry.get("link", "")
     link = re.sub(r"https?://[^/]+/", "https://twitter.com/", link)
+
     try:
         dt = datetime(*entry.published_parsed[:6])
         timestamp = dt.strftime("%d %b %Y, %I:%M %p UTC")
     except:
         timestamp = entry.get("published", "")
-    return (f"{CUSTOM_PREFIX}\n\n👤 *@{username}*\n🕐 {timestamp}\n\n{summary}\n\n[View on X ↗]({link})")
 
-async def send_to_telegram(message: str):
+    return (
+        f"{CUSTOM_PREFIX}\n\n"
+        f"👤 *@{username}*\n"
+        f"🕐 {timestamp}\n\n"
+        f"{summary}\n\n"
+        f"[View on X ↗]({link})"
+    )
+
+async def send_to_telegram(entry, username: str):
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
+    caption = format_caption(entry, username)
+    
+    # Try to get image from the tweet
+    summary_html = entry.get("summary", "")
+    image_url = extract_image(summary_html)
+    
     try:
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode="Markdown", disable_web_page_preview=False)
-        log.info("✅ Sent!")
+        if image_url:
+            # Send image with caption below
+            try:
+                await bot.send_photo(
+                    chat_id=TELEGRAM_CHAT_ID,
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
+                log.info(f"✅ Sent with image!")
+                return
+            except Exception as img_err:
+                log.warning(f"⚠️ Image send failed ({img_err}), sending as text...")
+        
+        # No image or image failed — send as text with preview
+        await bot.send_message(
+            chat_id=TELEGRAM_CHAT_ID,
+            text=caption,
+            parse_mode="Markdown",
+            disable_web_page_preview=False
+        )
+        log.info("✅ Sent as text!")
     except Exception as e:
         log.error(f"❌ Telegram error: {e}")
 
@@ -84,17 +147,19 @@ async def check_user(username: str):
             if not INCLUDE_RETWEETS and "RT by" in entry.get("title", ""):
                 seen_ids.add(uid)
                 continue
-            msg = format_message(entry, username)
-            await send_to_telegram(msg)
+            await send_to_telegram(entry, username)
             seen_ids.add(uid)
             new_count += 1
             await asyncio.sleep(0.5)
-        log.info(f"📨 @{username}: {new_count} new" if new_count else f"😴 @{username}: no new tweets")
+        if new_count:
+            log.info(f"📨 @{username}: {new_count} new tweet(s)")
+        else:
+            log.info(f"😴 @{username}: no new tweets")
     except Exception as e:
         log.error(f"Error (@{username}): {e}")
 
 async def run():
-    log.info("🚀 Twitter → Telegram Bot (Parallel)")
+    log.info("🚀 Twitter → Telegram Bot (Image + Caption mode)")
     log.info(f"📋 Monitoring: {', '.join(TWITTER_USERNAMES)}")
     log.info(f"⏱  Poll every {POLL_INTERVAL}s")
 
