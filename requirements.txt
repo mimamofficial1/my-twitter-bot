@@ -1,3 +1,3 @@
 python-telegram-bot==21.3
 yt-dlp==2024.11.18
-requests==2.32.3
+twikit==1.7.6
