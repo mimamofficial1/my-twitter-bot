@@ -73,15 +73,32 @@ async def fetch_tweets(username: str):
 
 # ─── Format Caption ───────────────────────────────────────────────────────────
 def format_caption(tweet, username: str) -> str:
-    text = getattr(tweet, 'full_text', None) or getattr(tweet, 'text', '') or ''
+    # Safely get text from twikit Tweet object
+    text = ""
+    for attr in ['full_text', 'text', 'legacy']:
+        val = getattr(tweet, attr, None)
+        if isinstance(val, str) and val:
+            text = val
+            break
+        elif isinstance(val, dict):
+            text = val.get('full_text') or val.get('text') or ''
+            if text:
+                break
+    
+    # Remove t.co links
     text = re.sub(r'https://t\.co/\S+', '', text).strip()
-    tweet_url = f"https://twitter.com/{username}/status/{tweet.id}"
+    
+    tweet_id = getattr(tweet, 'id', '') or ''
+    tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+
     try:
-        dt = datetime.strptime(tweet.created_at, "%a %b %d %H:%M:%S +0000 %Y")
+        created = getattr(tweet, 'created_at', '') or ''
+        dt = datetime.strptime(created, "%a %b %d %H:%M:%S +0000 %Y")
         dt_ist = dt + timedelta(hours=5, minutes=30)
         timestamp = dt_ist.strftime("%d %b %Y, %I:%M %p IST")
     except:
-        timestamp = str(tweet.created_at)
+        timestamp = str(getattr(tweet, 'created_at', ''))
+
     return (
         f"{CUSTOM_PREFIX}\n\n"
         f"👤 @{username}\n"
@@ -114,13 +131,27 @@ async def send_tweet(tweet, username: str):
     photo_url = None
     has_video = False
 
+    # Try multiple ways to get media from twikit object
     media = getattr(tweet, 'media', None) or []
+    if not media:
+        # Try from legacy/entities
+        legacy = getattr(tweet, 'legacy', {}) or {}
+        if isinstance(legacy, dict):
+            media = legacy.get('extended_entities', {}).get('media', []) or legacy.get('entities', {}).get('media', [])
+    
     for m in media:
-        mtype = getattr(m, 'type', '')
-        if mtype == 'photo' and not photo_url:
-            photo_url = getattr(m, 'media_url_https', None) or getattr(m, 'url', None)
-        elif mtype in ('video', 'animated_gif'):
-            has_video = True
+        if isinstance(m, dict):
+            mtype = m.get('type', '')
+            if mtype == 'photo' and not photo_url:
+                photo_url = m.get('media_url_https') or m.get('media_url')
+            elif mtype in ('video', 'animated_gif'):
+                has_video = True
+        else:
+            mtype = getattr(m, 'type', '')
+            if mtype == 'photo' and not photo_url:
+                photo_url = getattr(m, 'media_url_https', None) or getattr(m, 'url', None)
+            elif mtype in ('video', 'animated_gif'):
+                has_video = True
 
     if has_video:
         loop = asyncio.get_event_loop()
@@ -152,16 +183,19 @@ async def check_user(username: str):
     tweets = await fetch_tweets(username)
     new_count = 0
     for tweet in reversed(tweets):
-        tid = str(tweet.id)
-        if tid in seen_ids:
-            continue
-        if not INCLUDE_RETWEETS and getattr(tweet, 'retweeted_tweet', None):
+        try:
+            tid = str(getattr(tweet, 'id', '') or '')
+            if not tid or tid in seen_ids:
+                continue
+            if not INCLUDE_RETWEETS and getattr(tweet, 'retweeted_tweet', None):
+                seen_ids.add(tid)
+                continue
+            await send_tweet(tweet, username)
             seen_ids.add(tid)
-            continue
-        await send_tweet(tweet, username)
-        seen_ids.add(tid)
-        new_count += 1
-        await asyncio.sleep(1)
+            new_count += 1
+            await asyncio.sleep(1)
+        except Exception as e:
+            log.error(f"Error processing tweet @{username}: {e}")
     if new_count:
         log.info(f"📨 @{username}: {new_count} new!")
     else:
