@@ -19,10 +19,9 @@ def require_env(key):
 TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = require_env("TELEGRAM_CHAT_ID")
 TWITTER_USERNAMES  = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
-POLL_INTERVAL      = max(10, int(os.environ.get("POLL_INTERVAL_SECONDS", "10")))  # ⚡ 10s default
+POLL_INTERVAL      = max(15, int(os.environ.get("POLL_INTERVAL_SECONDS", "30")))
 INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
 CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
-SEND_ON_START      = int(os.environ.get("SEND_ON_START", "1"))  # 🆕 Startup pe kitne tweets bhejo
 
 NITTER_INSTANCES = [
     "https://nitter.privacyredirect.com",
@@ -53,13 +52,19 @@ async def fetch_tweets(username: str):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _fetch_sync, username)
 
-def extract_image(html: str):
+def extract_image(html: str) -> str | None:
+    """Extract first image URL from HTML content"""
+    # Try to find img tags
     match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
     if match:
         img_url = match.group(1)
+        # Convert nitter image proxy URL to original twitter/pbs.twimg.com URL
+        # Nitter proxies images like: /pic/media%2F...
         if img_url.startswith("/pic/"):
+            # Extract the encoded part
+            encoded = img_url[5:]  # Remove /pic/
             import urllib.parse
-            decoded = urllib.parse.unquote(img_url[5:])
+            decoded = urllib.parse.unquote(encoded)
             if not decoded.startswith("http"):
                 decoded = "https://pbs.twimg.com/" + decoded
             return decoded
@@ -68,10 +73,16 @@ def extract_image(html: str):
     return None
 
 def format_caption(entry, username: str) -> str:
+    """Format tweet text as Telegram caption"""
     summary = entry.get("summary", entry.get("title", ""))
+    
+    # Remove img tags but keep text
     summary = re.sub(r'<img[^>]+>', '', summary)
+    # Remove all other HTML tags
     summary = re.sub(r'<[^>]+>', '', summary).strip()
+    # Fix HTML entities
     summary = summary.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    # Clean up extra whitespace/newlines
     summary = re.sub(r'\n{3,}', '\n\n', summary).strip()
 
     link = entry.get("link", "")
@@ -94,10 +105,14 @@ def format_caption(entry, username: str) -> str:
 async def send_to_telegram(entry, username: str):
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
     caption = format_caption(entry, username)
-    image_url = extract_image(entry.get("summary", ""))
-
+    
+    # Try to get image from the tweet
+    summary_html = entry.get("summary", "")
+    image_url = extract_image(summary_html)
+    
     try:
         if image_url:
+            # Send image with caption below
             try:
                 await bot.send_photo(
                     chat_id=TELEGRAM_CHAT_ID,
@@ -109,7 +124,8 @@ async def send_to_telegram(entry, username: str):
                 return
             except Exception as img_err:
                 log.warning(f"⚠️ Image send failed ({img_err}), sending as text...")
-
+        
+        # No image or image failed — send as text with preview
         await bot.send_message(
             chat_id=TELEGRAM_CHAT_ID,
             text=caption,
@@ -134,7 +150,7 @@ async def check_user(username: str):
             await send_to_telegram(entry, username)
             seen_ids.add(uid)
             new_count += 1
-            await asyncio.sleep(0.3)  # ⚡ 0.5 → 0.3s
+            await asyncio.sleep(0.5)
         if new_count:
             log.info(f"📨 @{username}: {new_count} new tweet(s)")
         else:
@@ -142,41 +158,20 @@ async def check_user(username: str):
     except Exception as e:
         log.error(f"Error (@{username}): {e}")
 
-async def seed_user(username: str):
-    """🆕 Seed: baki sab seed karo, sirf latest N bhejo"""
-    try:
-        entries = await fetch_tweets(username)
-        if not entries:
-            return
-
-        # Latest SEND_ON_START tweets ko bhejne ke liye chhodo, baki seed karo
-        send_these = entries[:SEND_ON_START]   # newest first
-        seed_these = entries[SEND_ON_START:]   # older ones
-
-        for e in seed_these:
-            seen_ids.add(e.get("id") or e.get("link"))
-
-        log.info(f"✓ @{username} seeded {len(seed_these)}, sending {len(send_these)} on startup...")
-
-        for entry in reversed(send_these):   # oldest-first order mein bhejo
-            uid = entry.get("id") or entry.get("link")
-            if not INCLUDE_RETWEETS and "RT by" in entry.get("title", ""):
-                seen_ids.add(uid)
-                continue
-            await send_to_telegram(entry, username)
-            seen_ids.add(uid)
-            await asyncio.sleep(0.3)
-
-    except Exception as e:
-        log.warning(f"⚠️ Seed failed @{username}: {e}")
-
 async def run():
     log.info("🚀 Twitter → Telegram Bot (Image + Caption mode)")
     log.info(f"📋 Monitoring: {', '.join(TWITTER_USERNAMES)}")
-    log.info(f"⏱  Poll every {POLL_INTERVAL}s | 📤 Send on start: {SEND_ON_START}")
+    log.info(f"⏱  Poll every {POLL_INTERVAL}s")
 
-    log.info("🌱 Seeding + sending latest tweets...")
-    await asyncio.gather(*[seed_user(u) for u in TWITTER_USERNAMES])  # ⚡ parallel
+    log.info("🌱 Seeding...")
+    seed_results = await asyncio.gather(*[fetch_tweets(u) for u in TWITTER_USERNAMES], return_exceptions=True)
+    for username, result in zip(TWITTER_USERNAMES, seed_results):
+        if isinstance(result, Exception):
+            log.warning(f"⚠️ Seed failed @{username}: {result}")
+        else:
+            for e in result:
+                seen_ids.add(e.get("id") or e.get("link"))
+            log.info(f"✓ @{username} seeded {len(result)}")
 
     log.info("✅ Watching for NEW tweets!\n")
     while True:
