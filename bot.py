@@ -65,7 +65,14 @@ async def fetch_tweets(username: str):
     try:
         user = await twitter_client.get_user_by_screen_name(username)
         tweets = await user.get_tweets('Tweets', count=10)
-        return list(tweets)
+        result = list(tweets)
+        if result:
+            # Debug: log first tweet's attributes once
+            t = result[0]
+            attrs = [a for a in dir(t) if not a.startswith('_')]
+            log.info(f"🔍 @{username} tweet attrs: {attrs[:15]}")
+            log.info(f"🔍 tweet.text = {getattr(t, 'text', 'N/A')[:80]}")
+        return result
     except Exception as e:
         log.error(f"❌ fetch @{username}: {e}")
         return []
