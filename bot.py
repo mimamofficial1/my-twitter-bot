@@ -3,14 +3,14 @@ import os
 import logging
 import re
 import json
-import requests
 import telegram
 import yt_dlp
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
+import twikit
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
@@ -21,135 +21,75 @@ def require_env(key):
         raise EnvironmentError(f"❌ Missing env var: {key}")
     return val
 
-TELEGRAM_BOT_TOKEN = require_env("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID   = require_env("TELEGRAM_CHAT_ID")
-TWITTER_USERNAMES  = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
-POLL_INTERVAL      = max(15, int(os.environ.get("POLL_INTERVAL_SECONDS", "30")))
-INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
-CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 New Tweet")
-
-# Twitter's own public bearer token (used by their website)
-TWITTER_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I4xENYrAh74%2FtDkk3dYI05DHvHKN2PWDQVLB1bB7wc9v95%2F31E%2Frt%2FPqkpnM%3D"
+TELEGRAM_BOT_TOKEN  = require_env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID    = require_env("TELEGRAM_CHAT_ID")
+TWITTER_USERNAMES   = [u.strip().lstrip("@") for u in require_env("TWITTER_USERNAMES").split(",")]
+TWITTER_USERNAME    = require_env("TWITTER_USERNAME")   # Your Twitter login
+TWITTER_EMAIL       = require_env("TWITTER_EMAIL")      # Your Twitter email
+TWITTER_PASSWORD    = require_env("TWITTER_PASSWORD")   # Your Twitter password
+POLL_INTERVAL       = max(30, int(os.environ.get("POLL_INTERVAL_SECONDS", "60")))
+INCLUDE_RETWEETS    = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "true"
+CUSTOM_PREFIX       = os.environ.get("CUSTOM_PREFIX", "🐦 New Tweet")
 
 seen_ids: set = set()
-executor = ThreadPoolExecutor(max_workers=10)
+executor = ThreadPoolExecutor(max_workers=5)
+twitter_client = None
 
-# ─── Twitter Guest Token ───────────────────────────────────────────────────────
-guest_token = None
-
-def get_guest_token():
-    global guest_token
-    resp = requests.post(
-        "https://api.twitter.com/1.1/guest/activate.json",
-        headers={"Authorization": f"Bearer {TWITTER_BEARER}"},
-        timeout=10
-    )
-    guest_token = resp.json().get("guest_token")
-    log.info(f"✓ Guest token: {guest_token}")
-    return guest_token
-
-def twitter_headers():
-    return {
-        "Authorization": f"Bearer {TWITTER_BEARER}",
-        "x-guest-token": guest_token or get_guest_token(),
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://twitter.com/",
-        "x-twitter-active-user": "yes",
-        "x-twitter-client-language": "en",
-    }
-
-# ─── Fetch Tweets via Syndication API (no auth needed!) ───────────────────────
-def _fetch_sync(username: str):
-    """Use Twitter's syndication API — free, no key needed"""
-    try:
-        url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{username}"
-        params = {"count": 10, "includeAvailability": "true"}
-        resp = requests.get(url, params=params, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": f"https://twitter.com/{username}",
-        }, timeout=15)
-
-        if resp.status_code != 200:
-            raise Exception(f"HTTP {resp.status_code}")
-
-        # Extract JSON from the HTML response
-        html = resp.text
-        match = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', html, re.DOTALL)
-        if not match:
-            raise Exception("No JSON data found in response")
-
-        data = json.loads(match.group(1))
-        entries = (
-            data.get("props", {})
-                .get("pageProps", {})
-                .get("timeline", {})
-                .get("entries", [])
+# ─── Twitter Login ────────────────────────────────────────────────────────────
+async def init_twitter():
+    global twitter_client
+    client = twikit.Client(language="en-US")
+    cookies_file = "/tmp/twitter_cookies.json"
+    
+    if os.path.exists(cookies_file):
+        log.info("Loading saved cookies...")
+        client.load_cookies(cookies_file)
+    else:
+        log.info("Logging in to Twitter...")
+        await client.login(
+            auth_info_1=TWITTER_USERNAME,
+            auth_info_2=TWITTER_EMAIL,
+            password=TWITTER_PASSWORD
         )
+        client.save_cookies(cookies_file)
+        log.info("✅ Logged in & cookies saved!")
+    
+    twitter_client = client
+    return client
 
-        tweets = []
-        for entry in entries:
-            content = entry.get("content", {})
-            tweet = content.get("tweet", {})
-            if not tweet:
-                continue
-            tweets.append(tweet)
-
-        log.info(f"✓ Syndication API → @{username}: {len(tweets)} tweets")
-        return tweets
-
-    except Exception as e:
-        log.error(f"Syndication failed for @{username}: {e}")
-        raise
-
+# ─── Fetch Tweets ─────────────────────────────────────────────────────────────
 async def fetch_tweets(username: str):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(executor, _fetch_sync, username)
-
-# ─── Extract Media ────────────────────────────────────────────────────────────
-def extract_media(tweet: dict):
-    """Get image/video URL from tweet"""
-    media_list = (
-        tweet.get("entities", {}).get("media", []) or
-        tweet.get("extended_entities", {}).get("media", [])
-    )
-    photo_url = None
-    has_video = False
-    for m in media_list:
-        mtype = m.get("type", "")
-        if mtype == "photo" and not photo_url:
-            photo_url = m.get("media_url_https") or m.get("media_url")
-        elif mtype in ("video", "animated_gif"):
-            has_video = True
-    return photo_url, has_video
+    global twitter_client
+    try:
+        user = await twitter_client.get_user_by_screen_name(username)
+        tweets = await twitter_client.get_user_tweets(user.id, tweet_type="Tweets", count=10)
+        log.info(f"✓ @{username}: {len(tweets)} tweets fetched")
+        return tweets
+    except Exception as e:
+        log.error(f"Fetch failed @{username}: {e}")
+        return []
 
 # ─── Format Caption ───────────────────────────────────────────────────────────
-def format_caption(tweet: dict, username: str) -> str:
-    text = tweet.get("full_text") or tweet.get("text", "")
-    # Remove media URLs from text
-    for url_obj in tweet.get("entities", {}).get("urls", []):
-        text = text.replace(url_obj.get("url", ""), url_obj.get("expanded_url", ""))
-    # Remove pic.twitter.com links
+def format_caption(tweet, username: str) -> str:
+    text = tweet.full_text or tweet.text or ""
     text = re.sub(r'https://t\.co/\S+', '', text).strip()
 
-    tweet_id = tweet.get("id_str") or tweet.get("id")
-    link = f"https://twitter.com/{username}/status/{tweet_id}"
+    tweet_url = f"https://twitter.com/{username}/status/{tweet.id}"
 
-    created_at = tweet.get("created_at", "")
     try:
-        from datetime import timedelta
-        dt = datetime.strptime(created_at, "%a %b %d %H:%M:%S +0000 %Y")
+        # twikit returns created_at as string like "Thu Apr 24 01:01:00 +0000 2026"
+        dt = datetime.strptime(tweet.created_at, "%a %b %d %H:%M:%S +0000 %Y")
         dt_ist = dt + timedelta(hours=5, minutes=30)
         timestamp = dt_ist.strftime("%d %b %Y, %I:%M %p IST")
     except:
-        timestamp = created_at
+        timestamp = str(tweet.created_at)
 
     return (
         f"{CUSTOM_PREFIX}\n\n"
         f"👤 @{username}\n"
         f"🕐 {timestamp}\n\n"
         f"{text}\n\n"
-        f"View on X: {link}"
+        f"View on X: {tweet_url}"
     )
 
 # ─── Video Download ───────────────────────────────────────────────────────────
@@ -173,14 +113,23 @@ def download_video(tweet_url: str):
         log.warning(f"⚠️ Video download failed: {e}")
     return None
 
-# ─── Send Tweet to Telegram ───────────────────────────────────────────────────
-async def send_tweet(tweet: dict, username: str):
+# ─── Send to Telegram ─────────────────────────────────────────────────────────
+async def send_tweet(tweet, username: str):
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
     caption = format_caption(tweet, username)
-    photo_url, has_video = extract_media(tweet)
+    tweet_url = f"https://twitter.com/{username}/status/{tweet.id}"
 
-    tweet_id = tweet.get("id_str") or tweet.get("id")
-    tweet_url = f"https://twitter.com/{username}/status/{tweet_id}"
+    # Check for media
+    photo_url = None
+    has_video = False
+    
+    if hasattr(tweet, 'media') and tweet.media:
+        for m in tweet.media:
+            mtype = getattr(m, 'type', '')
+            if mtype == 'photo' and not photo_url:
+                photo_url = getattr(m, 'media_url_https', None) or getattr(m, 'url', None)
+            elif mtype in ('video', 'animated_gif'):
+                has_video = True
 
     # Try video
     if has_video:
@@ -201,7 +150,7 @@ async def send_tweet(tweet: dict, username: str):
             log.info("✅ Sent with photo!")
             return
         except Exception as e:
-            log.warning(f"⚠️ Photo send failed: {e}")
+            log.warning(f"⚠️ Photo failed: {e}")
 
     # Text fallback
     try:
@@ -210,98 +159,83 @@ async def send_tweet(tweet: dict, username: str):
     except Exception as e:
         log.error(f"❌ Send failed: {e}")
 
-# ─── Check User ───────────────────────────────────────────────────────────────
+# ─── Check One User ───────────────────────────────────────────────────────────
 async def check_user(username: str):
-    try:
-        tweets = await fetch_tweets(username)
-        new_count = 0
-        for tweet in reversed(tweets):
-            tid = str(tweet.get("id_str") or tweet.get("id", ""))
-            if not tid or tid in seen_ids:
-                continue
-            # Skip retweets
-            if not INCLUDE_RETWEETS and tweet.get("retweeted_status"):
-                seen_ids.add(tid)
-                continue
-            await send_tweet(tweet, username)
+    tweets = await fetch_tweets(username)
+    new_count = 0
+    for tweet in reversed(list(tweets)):
+        tid = str(tweet.id)
+        if tid in seen_ids:
+            continue
+        if not INCLUDE_RETWEETS and hasattr(tweet, 'retweeted_tweet') and tweet.retweeted_tweet:
             seen_ids.add(tid)
-            new_count += 1
-            await asyncio.sleep(0.5)
-        if new_count:
-            log.info(f"📨 @{username}: {new_count} new!")
-        else:
-            log.info(f"😴 @{username}: no new tweets")
-    except Exception as e:
-        log.error(f"Error @{username}: {e}")
+            continue
+        await send_tweet(tweet, username)
+        seen_ids.add(tid)
+        new_count += 1
+        await asyncio.sleep(1)
+    if new_count:
+        log.info(f"📨 @{username}: {new_count} new!")
+    else:
+        log.info(f"😴 @{username}: no new tweets")
 
 # ─── Bot Commands ─────────────────────────────────────────────────────────────
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usernames_list = "\n".join([f"• @{u}" for u in TWITTER_USERNAMES])
     msg = (
         f"👋 Welcome!\n\n"
-        f"🤖 Main Twitter to Telegram Auto-Forward Bot hoon!\n\n"
-        f"🐦 Monitor kar raha hoon:\n{usernames_list}\n\n"
+        f"🤖 Twitter to Telegram Auto-Forward Bot\n\n"
+        f"🐦 Monitor ho rahe hain:\n{usernames_list}\n\n"
         f"⚡ Features:\n"
-        f"• Tweets, Photos, Videos forward karta hoon\n"
-        f"• Har {POLL_INTERVAL} seconds mein check karta hoon\n\n"
-        f"📌 Commands:\n"
-        f"/start - Yeh message\n"
-        f"/status - Bot status\n\n"
+        f"• Tweets, Photos, Videos forward\n"
+        f"• Har {POLL_INTERVAL}s mein check\n\n"
+        f"📌 /start - Yeh message\n"
+        f"📌 /status - Bot status\n\n"
         f"✅ Bot active hai!"
     )
     await update.message.reply_text(msg)
 
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        f"🟢 Bot Status: Active\n\n"
+        f"🟢 Bot Active\n\n"
         f"👥 Accounts: {len(TWITTER_USERNAMES)}\n"
         f"⏱ Poll: {POLL_INTERVAL}s\n"
-        f"📨 Tweets tracked: {len(seen_ids)}\n\n"
+        f"📨 Tracked: {len(seen_ids)}\n\n"
         f"✅ Sab theek!"
     )
     await update.message.reply_text(msg)
 
-# ─── Forward Loop ─────────────────────────────────────────────────────────────
+# ─── Main Loop ────────────────────────────────────────────────────────────────
 async def forward_loop():
-    # Get guest token first
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(executor, get_guest_token)
+    await init_twitter()
 
-    log.info("🌱 Seeding existing tweets...")
-    seed_results = await asyncio.gather(*[fetch_tweets(u) for u in TWITTER_USERNAMES], return_exceptions=True)
-    for username, result in zip(TWITTER_USERNAMES, seed_results):
-        if isinstance(result, Exception):
-            log.warning(f"⚠️ Seed failed @{username}: {result}")
-        else:
-            for t in result:
-                tid = str(t.get("id_str") or t.get("id", ""))
-                if tid:
-                    seen_ids.add(tid)
-            log.info(f"✓ @{username} seeded {len(result)}")
+    # Seed
+    log.info("🌱 Seeding...")
+    for username in TWITTER_USERNAMES:
+        try:
+            tweets = await fetch_tweets(username)
+            for t in tweets:
+                seen_ids.add(str(t.id))
+            log.info(f"✓ @{username} seeded {len(tweets)}")
+            await asyncio.sleep(2)  # small delay between users while seeding
+        except Exception as e:
+            log.warning(f"⚠️ @{username}: {e}")
 
-    log.info("✅ Watching for NEW tweets!\n")
-    cycle = 0
+    log.info("✅ Watching for new tweets!\n")
+
     while True:
-        cycle += 1
-        # Refresh guest token every 50 cycles
-        if cycle % 50 == 0:
-            try:
-                await loop.run_in_executor(executor, get_guest_token)
-            except:
-                pass
-        await asyncio.gather(*[check_user(u) for u in TWITTER_USERNAMES])
+        # Check users one by one with small delay — avoids rate limiting
+        for username in TWITTER_USERNAMES:
+            await check_user(username)
+            await asyncio.sleep(3)  # 3s between each account
         log.info(f"💤 Sleeping {POLL_INTERVAL}s...")
         await asyncio.sleep(POLL_INTERVAL)
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
 async def main():
-    log.info("🚀 Twitter Bot starting (Syndication API mode)")
-    log.info(f"📋 {len(TWITTER_USERNAMES)} accounts | Poll: {POLL_INTERVAL}s")
-
+    log.info("🚀 Bot starting (twikit mode)...")
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("status", status_command))
-
     async with app:
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
