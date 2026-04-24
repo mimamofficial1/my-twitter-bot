@@ -28,11 +28,11 @@ INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "tru
 CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
 
 NITTER_INSTANCES = [
-    "https://nitter.privacyredirect.com",
-    "https://nitter.poast.org",
     "https://nitter.net",
+    "https://nitter.poast.org",
     "https://nitter.1d4.us",
     "https://nitter.kavin.rocks",
+    "https://nitter.privacyredirect.com",
 ]
 
 seen_ids: set = set()
@@ -42,31 +42,31 @@ executor = ThreadPoolExecutor(max_workers=10)
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     usernames_list = "\n".join([f"• @{u}" for u in TWITTER_USERNAMES])
     msg = (
-        "👋 *Welcome!*\n\n"
-        "🤖 Main ek *Twitter → Telegram Auto-Forward Bot* hoon!\n\n"
-        "🐦 *Main in accounts ko monitor kar raha hoon:*\n"
+        f"👋 Welcome!\n\n"
+        f"🤖 Main ek Twitter → Telegram Auto-Forward Bot hoon!\n\n"
+        f"🐦 Main in accounts ko monitor kar raha hoon:\n"
         f"{usernames_list}\n\n"
-        "⚡ *Kya karta hoon:*\n"
-        "• Naye tweets automatically forward karta hoon\n"
-        "• Photos aur Videos bhi bhejta hoon\n"
-        f"• Har *{POLL_INTERVAL} seconds* mein check karta hoon\n\n"
-        "📌 *Commands:*\n"
-        "/start - Yeh message dikhao\n"
-        "/status - Bot ka status check karo\n\n"
-        "✅ Bot chal raha hai — tweets aate rahenge!"
+        f"⚡ Kya karta hoon:\n"
+        f"• Naye tweets automatically forward karta hoon\n"
+        f"• Photos aur Videos bhi bhejta hoon\n"
+        f"• Har {POLL_INTERVAL} seconds mein check karta hoon\n\n"
+        f"📌 Commands:\n"
+        f"/start - Yeh message dikhao\n"
+        f"/status - Bot ka status check karo\n\n"
+        f"✅ Bot chal raha hai — tweets aate rahenge!"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)
 
 # ─── /status command ──────────────────────────────────────────────────────────
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = (
-        "🟢 *Bot Status: Active*\n\n"
-        f"👥 *Accounts monitored:* {len(TWITTER_USERNAMES)}\n"
-        f"⏱ *Poll interval:* {POLL_INTERVAL} seconds\n"
-        f"📨 *Tweets seen so far:* {len(seen_ids)}\n\n"
-        "✅ Sab theek chal raha hai!"
+        f"🟢 Bot Status: Active\n\n"
+        f"👥 Accounts monitored: {len(TWITTER_USERNAMES)}\n"
+        f"⏱ Poll interval: {POLL_INTERVAL} seconds\n"
+        f"📨 Tweets seen so far: {len(seen_ids)}\n\n"
+        f"✅ Sab theek chal raha hai!"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)
 
 # ─── Nitter RSS Fetch ─────────────────────────────────────────────────────────
 def _fetch_sync(username: str):
