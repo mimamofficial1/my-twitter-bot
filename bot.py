@@ -40,10 +40,21 @@ async def init_twitter():
     
     # Save cookies from env var to temp file
     cookies_file = "/tmp/twitter_cookies.json"
-    cookies_data = json.loads(TWITTER_COOKIES)
+    cookies_raw = json.loads(TWITTER_COOKIES)
+    
+    # Always convert to simple {name: value} dict — twikit needs this format
+    if isinstance(cookies_raw, list):
+        # Cookie-Editor format: [{"name":"auth_token","value":"...","domain":...}]
+        cookies_data = {c["name"]: c["value"] for c in cookies_raw if "name" in c and "value" in c}
+    elif isinstance(cookies_raw, dict):
+        cookies_data = cookies_raw
+    else:
+        raise ValueError("Invalid cookies format!")
+    
     with open(cookies_file, "w") as f:
         json.dump(cookies_data, f)
     
+    log.info(f"✅ Loaded {len(cookies_data)} cookies: {list(cookies_data.keys())}")
     client.load_cookies(cookies_file)
     log.info("✅ Twitter cookies loaded!")
     twitter_client = client
