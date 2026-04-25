@@ -4,7 +4,7 @@ import logging
 import re
 import feedparser
 import telegram
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
@@ -24,26 +24,34 @@ INCLUDE_RETWEETS   = os.environ.get("INCLUDE_RETWEETS", "false").lower() == "tru
 CUSTOM_PREFIX      = os.environ.get("CUSTOM_PREFIX", "🐦 *New Tweet*")
 
 NITTER_INSTANCES = [
-    "https://nitter.privacyredirect.com",
-    "https://nitter.poast.org",
     "https://nitter.net",
+    "https://nitter.poast.org",
     "https://nitter.1d4.us",
     "https://nitter.kavin.rocks",
+    "https://nitter.privacyredirect.com",
 ]
 
 seen_ids: set = set()
 executor = ThreadPoolExecutor(max_workers=10)
 
 def _fetch_sync(username: str):
+    import requests
     last_error = None
     for instance in NITTER_INSTANCES:
         url = f"{instance}/{username}/rss"
         try:
-            feed = feedparser.parse(url, request_headers={"User-Agent": "Mozilla/5.0"})
+            resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=8)
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                continue
+            feed = feedparser.parse(resp.content)
             if feed.entries and feed.feed.get("title"):
                 log.info(f"✓ {instance} → @{username}")
                 return feed.entries
-            last_error = str(feed.bozo_exception) if feed.bozo else "Empty feed"
+            last_error = "Empty feed"
+        except requests.exceptions.Timeout:
+            log.warning(f"⏰ Timeout: {instance} skipping...")
+            last_error = "Timeout"
         except Exception as e:
             last_error = str(e)
     raise Exception(f"All Nitter failed for @{username}: {last_error}")
@@ -52,19 +60,13 @@ async def fetch_tweets(username: str):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(executor, _fetch_sync, username)
 
-def extract_image(html: str) -> str | None:
-    """Extract first image URL from HTML content"""
-    # Try to find img tags
+def extract_image(html: str):
     match = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', html)
     if match:
         img_url = match.group(1)
-        # Convert nitter image proxy URL to original twitter/pbs.twimg.com URL
-        # Nitter proxies images like: /pic/media%2F...
         if img_url.startswith("/pic/"):
-            # Extract the encoded part
-            encoded = img_url[5:]  # Remove /pic/
             import urllib.parse
-            decoded = urllib.parse.unquote(encoded)
+            decoded = urllib.parse.unquote(img_url[5:])
             if not decoded.startswith("http"):
                 decoded = "https://pbs.twimg.com/" + decoded
             return decoded
@@ -73,27 +75,19 @@ def extract_image(html: str) -> str | None:
     return None
 
 def format_caption(entry, username: str) -> str:
-    """Format tweet text as Telegram caption"""
     summary = entry.get("summary", entry.get("title", ""))
-    
-    # Remove img tags but keep text
     summary = re.sub(r'<img[^>]+>', '', summary)
-    # Remove all other HTML tags
     summary = re.sub(r'<[^>]+>', '', summary).strip()
-    # Fix HTML entities
     summary = summary.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
-    # Clean up extra whitespace/newlines
     summary = re.sub(r'\n{3,}', '\n\n', summary).strip()
-
     link = entry.get("link", "")
     link = re.sub(r"https?://[^/]+/", "https://twitter.com/", link)
-
     try:
         dt = datetime(*entry.published_parsed[:6])
-        timestamp = dt.strftime("%d %b %Y, %I:%M %p UTC")
+        dt_ist = dt + timedelta(hours=5, minutes=30)
+        timestamp = dt_ist.strftime("%d %b %Y, %I:%M %p IST")
     except:
         timestamp = entry.get("published", "")
-
     return (
         f"{CUSTOM_PREFIX}\n\n"
         f"👤 *@{username}*\n"
@@ -105,33 +99,16 @@ def format_caption(entry, username: str) -> str:
 async def send_to_telegram(entry, username: str):
     bot = telegram.Bot(token=TELEGRAM_BOT_TOKEN)
     caption = format_caption(entry, username)
-    
-    # Try to get image from the tweet
-    summary_html = entry.get("summary", "")
-    image_url = extract_image(summary_html)
-    
+    image_url = extract_image(entry.get("summary", ""))
     try:
         if image_url:
-            # Send image with caption below
             try:
-                await bot.send_photo(
-                    chat_id=TELEGRAM_CHAT_ID,
-                    photo=image_url,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-                log.info(f"✅ Sent with image!")
+                await bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=image_url, caption=caption, parse_mode="Markdown")
+                log.info("✅ Sent with image!")
                 return
-            except Exception as img_err:
-                log.warning(f"⚠️ Image send failed ({img_err}), sending as text...")
-        
-        # No image or image failed — send as text with preview
-        await bot.send_message(
-            chat_id=TELEGRAM_CHAT_ID,
-            text=caption,
-            parse_mode="Markdown",
-            disable_web_page_preview=False
-        )
+            except Exception as e:
+                log.warning(f"⚠️ Image failed: {e}")
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=caption, parse_mode="Markdown", disable_web_page_preview=False)
         log.info("✅ Sent as text!")
     except Exception as e:
         log.error(f"❌ Telegram error: {e}")
@@ -159,10 +136,9 @@ async def check_user(username: str):
         log.error(f"Error (@{username}): {e}")
 
 async def run():
-    log.info("🚀 Twitter → Telegram Bot (Image + Caption mode)")
+    log.info("🚀 Twitter → Telegram Bot (Nitter RSS)")
     log.info(f"📋 Monitoring: {', '.join(TWITTER_USERNAMES)}")
     log.info(f"⏱  Poll every {POLL_INTERVAL}s")
-
     log.info("🌱 Seeding...")
     seed_results = await asyncio.gather(*[fetch_tweets(u) for u in TWITTER_USERNAMES], return_exceptions=True)
     for username, result in zip(TWITTER_USERNAMES, seed_results):
@@ -172,7 +148,6 @@ async def run():
             for e in result:
                 seen_ids.add(e.get("id") or e.get("link"))
             log.info(f"✓ @{username} seeded {len(result)}")
-
     log.info("✅ Watching for NEW tweets!\n")
     while True:
         await asyncio.gather(*[check_user(u) for u in TWITTER_USERNAMES])
