@@ -6,39 +6,28 @@ import telegram, yt_dlp
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
-# ── Patch twikit User.__init__ to fix 'urls' and 'pinned_tweet_ids_str' crash ─
-import twikit.user as _user_mod
-_orig_user_init = _user_mod.User.__init__
-
-def _safe_user_init(self, client, data, *args, **kwargs):
+# ── Patch twikit User to fix 'urls' crash ─────────────────────────────────────
+import twikit.user as _um
+_orig = _um.User.__init__
+def _safe(self, client, data, *args, **kwargs):
     try:
-        # Fix missing keys in legacy before twikit processes them
-        legacy = data.get('legacy', {})
-        if isinstance(legacy, dict):
-            # Fix description urls
-            entities = legacy.setdefault('entities', {})
-            desc = entities.setdefault('description', {})
-            desc.setdefault('urls', [])
-            # Fix pinned_tweet_ids_str
-            legacy.setdefault('pinned_tweet_ids_str', [])
-            # Fix other optional fields
-            for field in ('possibly_sensitive', 'can_dm', 'can_media_tag',
-                         'want_retweets', 'has_custom_timelines'):
-                legacy.setdefault(field, False)
-    except Exception:
-        pass
+        leg = data.get('legacy', {})
+        if isinstance(leg, dict):
+            ent = leg.setdefault('entities', {})
+            ent.setdefault('description', {}).setdefault('urls', [])
+            leg.setdefault('pinned_tweet_ids_str', [])
+            for f in ('possibly_sensitive','can_dm','can_media_tag','want_retweets','has_custom_timelines'):
+                leg.setdefault(f, False)
+    except: pass
     try:
-        _orig_user_init(self, client, data, *args, **kwargs)
+        _orig(self, client, data, *args, **kwargs)
     except Exception as e:
-        # Minimal user object
-        legacy = data.get('legacy', {}) if isinstance(data, dict) else {}
+        leg = data.get('legacy', {}) if isinstance(data, dict) else {}
         self.id = data.get('rest_id', '') if isinstance(data, dict) else ''
-        self.name = legacy.get('name', '')
-        self.screen_name = legacy.get('screen_name', '')
+        self.name = leg.get('name', '')
+        self.screen_name = leg.get('screen_name', '')
         self._client = client
-        log.warning(f"User init patched: {e}")
-
-_user_mod.User.__init__ = _safe_user_init
+_um.User.__init__ = _safe
 
 import twikit
 
@@ -51,13 +40,14 @@ BOT_TOKEN    = env("TELEGRAM_BOT_TOKEN")
 CHAT_ID      = env("TELEGRAM_CHAT_ID")
 USERNAMES    = [u.strip().lstrip("@") for u in env("TWITTER_USERNAMES").split(",") if u.strip()]
 COOKIES_JSON = env("TWITTER_COOKIES")
-POLL         = max(30, int(os.environ.get("POLL_INTERVAL_SECONDS", "60")))
+POLL         = max(60, int(os.environ.get("POLL_INTERVAL_SECONDS", "120")))
 SKIP_RT      = os.environ.get("INCLUDE_RETWEETS", "false").lower() != "true"
 PREFIX       = os.environ.get("CUSTOM_PREFIX", "🐦 New Tweet")
 
 seen: set = set()
 pool = ThreadPoolExecutor(max_workers=4)
 client: twikit.Client = None
+user_cache: dict = {}  # username → user object (cache to save API calls)
 
 async def init():
     global client
@@ -68,13 +58,32 @@ async def init():
     client.load_cookies("/tmp/ck.json")
     log.info(f"✅ {len(cdict)} cookies loaded")
 
+async def get_user(username):
+    """Get user with caching — saves 1 API call per account per cycle"""
+    if username not in user_cache:
+        user_cache[username] = await client.get_user_by_screen_name(username)
+        log.info(f"📦 Cached @{username}")
+        await asyncio.sleep(2)  # small delay after getting user
+    return user_cache[username]
+
 async def get_tweets(username):
-    try:
-        user = await client.get_user_by_screen_name(username)
-        return list(await user.get_tweets("Tweets", count=10))
-    except Exception as e:
-        log.error(f"❌ @{username}: {e}")
-        return []
+    for attempt in range(3):
+        try:
+            user = await get_user(username)
+            tweets = list(await user.get_tweets("Tweets", count=10))
+            return tweets
+        except Exception as e:
+            err = str(e)
+            if '429' in err or 'Rate limit' in err:
+                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
+                log.warning(f"⏳ Rate limit @{username} — waiting {wait}s...")
+                await asyncio.sleep(wait)
+                # Clear user cache on rate limit so fresh fetch next time
+                user_cache.pop(username, None)
+            else:
+                log.error(f"❌ @{username}: {e}")
+                return []
+    return []
 
 def parse(tw):
     tid = str(getattr(tw, "id", "") or "")
@@ -97,9 +106,9 @@ def parse(tw):
     photo, has_vid = None, False
     try:
         for m in (getattr(tw, "media", None) or []):
-            mt = getattr(m, "type", "") if hasattr(m, "type") else m.get("type", "")
+            mt = getattr(m, "type", "") if hasattr(m, "type") else m.get("type","")
             if mt == "photo" and not photo:
-                photo = getattr(m, "media_url_https", None) or (m.get("media_url_https") if isinstance(m, dict) else None)
+                photo = getattr(m, "media_url_https", None) or (m.get("media_url_https") if isinstance(m,dict) else None)
             elif mt in ("video", "animated_gif"):
                 has_vid = True
     except: pass
@@ -116,29 +125,26 @@ async def send(tid, text, ts, username, photo, has_vid):
         try:
             def dl():
                 with tempfile.TemporaryDirectory() as d:
-                    with yt_dlp.YoutubeDL({"outtmpl": f"{d}/v.%(ext)s", "format": "best[filesize<50M]/best", "quiet": True}) as y:
+                    with yt_dlp.YoutubeDL({"outtmpl":f"{d}/v.%(ext)s","format":"best[filesize<50M]/best","quiet":True}) as y:
                         y.extract_info(url, download=True)
                     fs = os.listdir(d)
-                    return open(f"{d}/{fs[0]}", "rb").read() if fs else None
+                    return open(f"{d}/{fs[0]}","rb").read() if fs else None
             vdata = await asyncio.get_event_loop().run_in_executor(pool, dl)
             if vdata:
                 await bot.send_video(chat_id=CHAT_ID, video=vdata, caption=cap, supports_streaming=True)
                 log.info(f"✅ Video @{username}"); return
-        except Exception as e:
-            log.warning(f"Video fail: {e}")
+        except Exception as e: log.warning(f"Video: {e}")
 
     if photo:
         try:
             await bot.send_photo(chat_id=CHAT_ID, photo=photo, caption=cap)
             log.info(f"✅ Photo @{username}"); return
-        except Exception as e:
-            log.warning(f"Photo fail: {e}")
+        except Exception as e: log.warning(f"Photo: {e}")
 
     try:
         await bot.send_message(chat_id=CHAT_ID, text=cap, disable_web_page_preview=False)
         log.info(f"✅ Text @{username}")
-    except Exception as e:
-        log.error(f"❌ @{username}: {e}")
+    except Exception as e: log.error(f"❌ @{username}: {e}")
 
 async def check(username):
     tweets = await get_tweets(username)
@@ -158,8 +164,19 @@ async def check(username):
     log.info(f"📨 @{username}: {new} new!" if new else f"😴 @{username}: no new")
 
 async def main():
-    log.info(f"🚀 Bot | {len(USERNAMES)} accounts | {POLL}s")
+    log.info(f"🚀 Bot | {len(USERNAMES)} accounts | {POLL}s poll")
     await init()
+
+    # Cache all users upfront with delays to avoid rate limit
+    log.info("📦 Caching users...")
+    for u in USERNAMES:
+        try:
+            await get_user(u)
+        except Exception as e:
+            log.warning(f"Cache @{u}: {e}")
+        await asyncio.sleep(3)
+
+    # Seed
     log.info("🌱 Seeding...")
     for u in USERNAMES:
         try:
@@ -172,12 +189,13 @@ async def main():
             log.info(f"✓ @{u} seeded {len(tws)}")
         except Exception as e:
             log.warning(f"Seed @{u}: {e}")
-        await asyncio.sleep(1)
+        await asyncio.sleep(5)  # 5s between each account during seeding
+
     log.info("✅ Watching!\n")
     while True:
         for u in USERNAMES:
             await check(u)
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)  # 5s between each account
         log.info(f"💤 {POLL}s...")
         await asyncio.sleep(POLL)
 
