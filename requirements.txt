@@ -1,2 +1,2 @@
-twscrape==0.14.2
+twscrape==0.17.0
 requests==2.31.0
