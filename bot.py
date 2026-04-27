@@ -1,87 +1,46 @@
 import os
-import time
+import asyncio
 import logging
 import requests
-import feedparser
-from datetime import datetime
-from bs4 import BeautifulSoup
+from datetime import datetime, timezone
+from twscrape import API, gather
+from twscrape.logger import set_log_level
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+set_log_level("ERROR")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-TWITTER_USERNAMES  = os.environ.get("TWITTER_USERNAMES", "").split(",")
-CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "120"))
+TELEGRAM_BOT_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "")
+TWITTER_USERNAMES   = [u.strip() for u in os.environ.get("TWITTER_USERNAMES", "").split(",") if u.strip()]
+CHECK_INTERVAL      = int(os.environ.get("CHECK_INTERVAL", "120"))
 
-NITTER_INSTANCES = [
-    "https://nitter.privacyredirect.com",
-    "https://nitter.poast.org",
-    "https://nitter.net",
-    "https://nitter.1d4.us",
-    "https://nitter.kavin.rocks",
-]
+# Twitter account credentials (Railway variables mein daalna)
+TW_USERNAME  = os.environ.get("TW_USERNAME", "")
+TW_PASSWORD  = os.environ.get("TW_PASSWORD", "")
+TW_EMAIL     = os.environ.get("TW_EMAIL", "")
 
+# ─── STATE ────────────────────────────────────────────────────────────────────
 seen_ids: set = set()
+user_id_cache: dict = {}
 
 
-def get_nitter_rss(username: str):
-    """Try each Nitter instance until one works."""
-    for instance in NITTER_INSTANCES:
-        url = f"{instance}/{username}/rss"
-        try:
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200 and "<rss" in resp.text:
-                feed = feedparser.parse(resp.text)
-                if feed.entries:
-                    logger.info(f"✅ {instance} worked for @{username}")
-                    return feed
-        except Exception as e:
-            logger.warning(f"❌ {instance} failed: {e}")
-    logger.error(f"All Nitter instances failed for @{username}")
-    return None
-
-
-def extract_image(entry) -> str:
-    """RSS entry se pehli image URL nikaalte hain."""
-    if hasattr(entry, "media_content") and entry.media_content:
-        url = entry.media_content[0].get("url", "")
-        if url:
-            return url
-
-    summary = entry.get("summary", "")
-    if summary:
-        soup = BeautifulSoup(summary, "html.parser")
-        img = soup.find("img")
-        if img and img.get("src"):
-            src = img["src"]
-            if src.startswith("/pic/"):
-                src = f"https://nitter.privacyredirect.com{src}"
-            return src
-
-    return ""
-
-
-def clean_text(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    return soup.get_text(separator=" ").strip()
-
-
+# ─── TELEGRAM ─────────────────────────────────────────────────────────────────
 def send_telegram_photo(image_url: str, caption: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
         "photo": image_url,
-        "caption": caption,
+        "caption": caption[:1024],
         "parse_mode": "HTML",
     }
     resp = requests.post(api, json=payload, timeout=15)
     if not resp.ok:
-        logger.warning(f"sendPhoto failed ({resp.status_code}), falling back to text")
+        logger.warning(f"sendPhoto failed ({resp.status_code}), trying text...")
         send_telegram_text(caption)
 
 
@@ -89,7 +48,7 @@ def send_telegram_text(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
+        "text": text[:4096],
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
@@ -98,94 +57,135 @@ def send_telegram_text(text: str):
         logger.error(f"sendMessage failed: {resp.status_code} {resp.text}")
 
 
-def fix_link(link: str) -> str:
-    for instance in NITTER_INSTANCES:
-        domain = instance.replace("https://", "")
-        link = link.replace(domain, "twitter.com")
-    return link
-
-
-def format_caption(username: str, entry) -> str:
-    tweet_text = clean_text(entry.get("summary", ""))
-    link = fix_link(entry.get("link", ""))
+def format_caption(tweet) -> str:
+    username = tweet.user.username
+    name     = tweet.user.displayname
+    text     = tweet.rawContent or ""
+    link     = f"https://twitter.com/{username}/status/{tweet.id}"
 
     try:
-        dt = datetime(*entry.published_parsed[:6])
-        time_str = dt.strftime("%d %b %Y, %I:%M %p")
+        time_str = tweet.date.strftime("%d %b %Y, %I:%M %p UTC")
     except Exception:
-        time_str = entry.get("published", "")
+        time_str = ""
 
     caption = (
-        f"🐦 <b>@{username}</b>\n"
+        f"🐦 <b>{name}</b> (@{username})\n"
         f"🕐 {time_str}\n\n"
-        f"{tweet_text}\n\n"
+        f"{text}\n\n"
         f"🔗 <a href='{link}'>Tweet dekho</a>"
     )
     return caption
 
 
-def process_feed(username: str):
-    feed = get_nitter_rss(username)
-    if not feed:
+def get_best_image(tweet) -> str:
+    """Tweet se best image URL nikaalte hain."""
+    try:
+        if tweet.media and tweet.media.photos:
+            return tweet.media.photos[0].url
+    except Exception:
+        pass
+    return ""
+
+
+# ─── TWSCRAPE ─────────────────────────────────────────────────────────────────
+async def setup_account(api: API):
+    """Twitter account add karo agar already nahi hai."""
+    accounts = await api.pool.get_all()
+    if not accounts:
+        logger.info("🔑 Twitter account add kar raha hoon...")
+        await api.pool.add_account(
+            username=TW_USERNAME,
+            password=TW_PASSWORD,
+            email=TW_EMAIL,
+            email_password="",  # agar email password nahi hai
+        )
+        await api.pool.login_all()
+        logger.info("✅ Twitter login successful!")
+    else:
+        logger.info(f"✅ Account already logged in: {accounts[0].username}")
+
+
+async def get_user_id(api: API, username: str) -> int:
+    """Username se user ID nikaalte hain (cache karte hain)."""
+    if username in user_id_cache:
+        return user_id_cache[username]
+    user = await api.user_by_login(username)
+    if user:
+        user_id_cache[username] = user.id
+        return user.id
+    return 0
+
+
+async def fetch_new_tweets(api: API, username: str):
+    """Naye tweets fetch karke Telegram pe bhejo."""
+    user_id = await get_user_id(api, username)
+    if not user_id:
+        logger.error(f"❌ User not found: @{username}")
         return
 
-    new_tweets = []
-    for entry in feed.entries:
-        tweet_id = entry.get("id", entry.get("link", ""))
-        if tweet_id and tweet_id not in seen_ids:
-            new_tweets.append((tweet_id, entry))
+    try:
+        tweets = await gather(api.user_tweets(user_id, limit=10))
+    except Exception as e:
+        logger.error(f"❌ Error fetching tweets for @{username}: {e}")
+        return
 
-    for tweet_id, entry in reversed(new_tweets):
-        seen_ids.add(tweet_id)
-        caption = format_caption(username, entry)
-        image_url = extract_image(entry)
+    new_tweets = [t for t in tweets if t.id not in seen_ids]
+
+    for tweet in reversed(new_tweets):
+        seen_ids.add(tweet.id)
+        caption   = format_caption(tweet)
+        image_url = get_best_image(tweet)
 
         if image_url:
-            logger.info(f"📸 Sending photo tweet from @{username}")
+            logger.info(f"📸 Photo tweet from @{username} — {tweet.id}")
             send_telegram_photo(image_url, caption)
         else:
-            logger.info(f"📝 Sending text tweet from @{username}")
+            logger.info(f"📝 Text tweet from @{username} — {tweet.id}")
             send_telegram_text(caption)
 
-        time.sleep(1)
+        await asyncio.sleep(1)
 
 
-def initialize():
+async def initialize(api: API):
+    """Pehli run pe purane tweets mark karo — spam nahi aayega."""
     logger.info("🚀 Bot start — purane tweets skip kar raha hoon...")
     for username in TWITTER_USERNAMES:
-        username = username.strip()
-        if not username:
+        user_id = await get_user_id(api, username)
+        if not user_id:
             continue
-        feed = get_nitter_rss(username)
-        if feed:
-            for entry in feed.entries:
-                tweet_id = entry.get("id", entry.get("link", ""))
-                if tweet_id:
-                    seen_ids.add(tweet_id)
-            logger.info(f"✅ @{username} — {len(feed.entries)} purane tweets skip kiye")
+        try:
+            tweets = await gather(api.user_tweets(user_id, limit=20))
+            for t in tweets:
+                seen_ids.add(t.id)
+            logger.info(f"✅ @{username} — {len(tweets)} purane tweets skip kiye")
+        except Exception as e:
+            logger.error(f"❌ @{username} initialize error: {e}")
+        await asyncio.sleep(1)
 
 
-def main():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("❌ TELEGRAM_BOT_TOKEN aur TELEGRAM_CHAT_ID set karo!")
+async def main():
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_PASSWORD, TW_EMAIL]):
+        logger.error("❌ Saare environment variables set karo!")
+        logger.error("Chahiye: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_PASSWORD, TW_EMAIL")
         return
 
-    if not any(u.strip() for u in TWITTER_USERNAMES):
+    if not TWITTER_USERNAMES:
         logger.error("❌ TWITTER_USERNAMES set karo!")
         return
 
-    initialize()
+    api = API()
+    await setup_account(api)
+    await initialize(api)
 
-    logger.info(f"👀 Monitoring: {', '.join('@' + u.strip() for u in TWITTER_USERNAMES)}")
+    logger.info(f"👀 Monitoring {len(TWITTER_USERNAMES)} accounts...")
     logger.info(f"⏱️ Har {CHECK_INTERVAL} seconds pe check karega")
 
     while True:
         for username in TWITTER_USERNAMES:
-            username = username.strip()
-            if username:
-                process_feed(username)
-        time.sleep(CHECK_INTERVAL)
+            await fetch_new_tweets(api, username)
+            await asyncio.sleep(2)  # accounts ke beech thodi delay
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
