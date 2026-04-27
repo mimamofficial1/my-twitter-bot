@@ -1,84 +1,80 @@
-# 🐦➡️📱 Twitter → Telegram Auto-Forward Bot
+# 🐦 Twitter → Telegram Auto-Forward Bot
 
-Automatically forwards tweets from any Twitter/X accounts to your Telegram channel or group.
-
----
-
-## 🚀 Setup Guide
-
-### Step 1 — Get Twitter API Access (Free)
-1. Go to https://developer.twitter.com/en/portal/dashboard
-2. Create a new Project + App
-3. Under **Keys and Tokens**, copy your **Bearer Token**
-4. Paste it in `config.json` → `twitter_bearer_token`
-
-> ⚠️ Free tier allows ~500,000 tweets/month read. Set poll_interval_seconds ≥ 60.
-
----
-
-### Step 2 — Create a Telegram Bot
-1. Open Telegram, search `@BotFather`
-2. Send `/newbot` and follow the steps
-3. Copy the **HTTP API token**
-4. Paste in `config.json` → `telegram_bot_token`
-
----
-
-### Step 3 — Get Your Chat ID
-**For a channel:**
-- Add the bot as **Admin** to your channel
-- Use `@your_channel_name` as `telegram_chat_id`
-
-**For a group/DM:**
-- Add bot to the group, send a message
-- Visit: `https://api.telegram.org/bot<TOKEN>/getUpdates`
-- Find `"chat":{"id":...}` — use that number as `telegram_chat_id`
-
----
-
-### Step 4 — Configure `config.json`
-```json
-{
-  "twitter_usernames": ["@elonmusk", "@OpenAI"],
-  "poll_interval_seconds": 60,
-  "include_retweets": false,
-  "include_replies": false,
-  "forward_media": true
-}
-```
-
----
-
-### Step 5 — Install & Run
-```bash
-pip install -r requirements.txt
-python bot.py
-```
-
----
-
-## 🔄 Run 24/7 (Optional)
-
-**Using screen (Linux/Mac):**
-```bash
-screen -S twitterbot
-python bot.py
-# Press Ctrl+A then D to detach
-```
-
-**Using PM2:**
-```bash
-npm install -g pm2
-pm2 start bot.py --interpreter python3
-pm2 save
-```
+Nitter RSS se tweets fetch karke Telegram pe automatically forward karta hai.
+Koi Twitter API key nahi chahiye!
 
 ---
 
 ## 📁 Files
-| File | Purpose |
-|------|---------|
-| `bot.py` | Main bot script |
-| `config.json` | Your settings & API keys |
-| `state.json` | Auto-created, tracks last seen tweets |
-| `bot.log` | Auto-created, logs all activity |
+
+```
+bot.py              ← Main bot code
+requirements.txt    ← Python dependencies
+Procfile            ← Railway worker command
+runtime.txt         ← Python version
+railway.toml        ← Railway config
+```
+
+---
+
+## 🚀 Railway Deploy Steps
+
+### Step 1 — GitHub Repo banao
+1. GitHub pe naya repo banao (e.g. `twitter-telegram-bot`)
+2. Yeh saari files upload karo
+
+### Step 2 — Railway pe project banao
+1. [railway.com](https://railway.com) pe jao → Login karo
+2. **New Project** → **Deploy from GitHub repo**
+3. Apna repo select karo
+
+### Step 3 — Environment Variables set karo
+Railway dashboard mein → **Variables** tab → yeh add karo:
+
+| Variable | Value |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | BotFather se mila token |
+| `TELEGRAM_CHAT_ID` | Channel/group ID (e.g. `-1001234567890`) |
+| `TWITTER_USERNAMES` | `user1,user2,user3` (comma separated) |
+| `CHECK_INTERVAL` | `120` (optional, default 2 min) |
+
+### Step 4 — Deploy!
+Variables save karo → Railway automatically deploy karega ✅
+
+---
+
+## 🤖 Telegram Bot & Chat ID kaise pata karo?
+
+### Bot Token:
+1. Telegram mein [@BotFather](https://t.me/BotFather) pe jao
+2. `/newbot` → naam do → token copy karo
+
+### Chat ID (Channel ke liye):
+1. Bot ko channel mein admin banao
+2. `https://api.telegram.org/bot<TOKEN>/getUpdates` open karo
+3. `chat.id` copy karo (negative number hoga e.g. `-1001234567890`)
+
+---
+
+## ✨ Features
+
+- 📸 Image upar + caption neeche format
+- 🔄 5 Nitter instances — ek fail ho toh doosra automatically
+- ✅ Pehli run pe purane tweets skip (spam nahi aayega)
+- ✅ Image nahi hai tweet mein → sirf text bhejega
+- 🔗 Links twitter.com pe point karte hain
+- ♻️ Railway pe crash ho toh auto-restart
+
+---
+
+## 🛠️ Local Test karna ho toh
+
+```bash
+pip install -r requirements.txt
+
+export TELEGRAM_BOT_TOKEN="your_token"
+export TELEGRAM_CHAT_ID="-100xxxxxxxxx"
+export TWITTER_USERNAMES="elonmusk,OpenAI"
+
+python bot.py
+```
