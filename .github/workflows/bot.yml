@@ -1,0 +1,55 @@
+name: Twitter to Telegram Bot
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # Har 15 minute mein run karega
+  workflow_dispatch:           # Manual run bhi kar sakte ho
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write          # seen_ids.json commit karne ke liye
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore seen_ids
+        uses: actions/cache@v4
+        with:
+          path: seen_ids.json
+          key: seen-ids-${{ github.run_id }}
+          restore-keys: seen-ids-
+
+      - name: Run bot
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TWITTER_USERNAMES: ${{ secrets.TWITTER_USERNAMES }}
+          TW_USERNAME: ${{ secrets.TW_USERNAME }}
+          TW_PASSWORD: ${{ secrets.TW_PASSWORD }}
+          TW_EMAIL: ${{ secrets.TW_EMAIL }}
+        run: python bot.py
+
+      - name: Save seen_ids to repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add seen_ids.json
+          git diff --staged --quiet || git commit -m "Update seen_ids [skip ci]"
+          git push
