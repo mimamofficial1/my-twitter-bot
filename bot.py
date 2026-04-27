@@ -1,10 +1,42 @@
 import asyncio, os, logging, re, json, tempfile
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-import telegram, yt_dlp, twikit
+import telegram, yt_dlp
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
+
+# ── Patch twikit BEFORE importing to fix 'urls' crash ─────────────────────────
+import twikit.tweet as _tw_module
+_orig_tweet_init = _tw_module.Tweet.__init__
+
+def _safe_tweet_init(self, client, data, *args, **kwargs):
+    try:
+        # Sanitize URLs in entities to prevent crash
+        if isinstance(data, dict):
+            for key in ('entities', 'legacy'):
+                d = data.get(key, {})
+                if isinstance(d, dict) and 'urls' in d:
+                    urls = d['urls']
+                    if isinstance(urls, list):
+                        d['urls'] = [u for u in urls if isinstance(u, dict) and 'url' in u]
+    except Exception:
+        pass
+    try:
+        _orig_tweet_init(self, client, data, *args, **kwargs)
+    except Exception as e:
+        # Still construct a minimal usable object
+        self.id = data.get('id_str') or data.get('rest_id') or ''
+        self.text = data.get('full_text') or data.get('text') or ''
+        self.created_at = data.get('created_at') or ''
+        self.media = []
+        self.urls = []
+        self.retweeted_tweet = None
+        log.warning(f"Tweet init patched: {e}")
+
+_tw_module.Tweet.__init__ = _safe_tweet_init
+
+import twikit
 
 def env(k):
     v = os.environ.get(k)
@@ -23,7 +55,6 @@ seen: set = set()
 pool = ThreadPoolExecutor(max_workers=4)
 client: twikit.Client = None
 
-# ── Init ──────────────────────────────────────────────────────────────────────
 async def init():
     global client
     raw = json.loads(COOKIES_JSON)
@@ -31,35 +62,27 @@ async def init():
     with open("/tmp/ck.json", "w") as f: json.dump(cdict, f)
     client = twikit.Client(language="en-US")
     client.load_cookies("/tmp/ck.json")
-    log.info(f"✅ Cookies loaded ({len(cdict)})")
+    log.info(f"✅ {len(cdict)} cookies loaded")
 
-# ── Fetch ─────────────────────────────────────────────────────────────────────
 async def get_tweets(username):
     try:
         user = await client.get_user_by_screen_name(username)
-        tweets = await user.get_tweets("Tweets", count=10)
-        return list(tweets)
+        return list(await user.get_tweets("Tweets", count=10))
     except Exception as e:
         log.error(f"❌ @{username}: {e}")
         return []
 
-# ── Parse tweet safely ────────────────────────────────────────────────────────
 def parse(tw):
-    # ID
-    tid = str(getattr(tw, "id", "") or getattr(tw, "rest_id", "") or "")
-
-    # Text — try all possible attributes
+    tid  = str(getattr(tw, "id", "") or "")
     text = ""
-    for attr in ("full_text", "text"):
+    for a in ("full_text", "text"):
         try:
-            v = getattr(tw, attr, None)
-            if isinstance(v, str) and len(v) > 0:
-                text = v
-                break
+            v = getattr(tw, a, None)
+            if isinstance(v, str) and v:
+                text = v; break
         except: pass
     text = re.sub(r"https://t\.co/\S+", "", text).strip()
 
-    # Time
     ts = ""
     try:
         ca = str(getattr(tw, "created_at", "") or "")
@@ -67,7 +90,6 @@ def parse(tw):
         ts = (dt + timedelta(hours=5, minutes=30)).strftime("%d %b %Y, %I:%M %p IST")
     except: pass
 
-    # Photo/video
     photo, has_vid = None, False
     try:
         for m in (getattr(tw, "media", None) or []):
@@ -78,12 +100,9 @@ def parse(tw):
                 has_vid = True
     except: pass
 
-    # Retweet check
     is_rt = bool(getattr(tw, "retweeted_tweet", None)) or text.startswith("RT @")
-
     return tid, text, ts, photo, has_vid, is_rt
 
-# ── Send ──────────────────────────────────────────────────────────────────────
 async def send(tid, text, ts, username, photo, has_vid):
     bot = telegram.Bot(token=BOT_TOKEN)
     url = f"https://twitter.com/{username}/status/{tid}"
@@ -96,9 +115,7 @@ async def send(tid, text, ts, username, photo, has_vid):
                     with yt_dlp.YoutubeDL({"outtmpl": f"{d}/v.%(ext)s", "format": "best[filesize<50M]/best", "quiet": True}) as y:
                         y.extract_info(url, download=True)
                     fs = os.listdir(d)
-                    if fs:
-                        with open(f"{d}/{fs[0]}", "rb") as f: return f.read()
-                return None
+                    return open(f"{d}/{fs[0]}", "rb").read() if fs else None
             vdata = await asyncio.get_event_loop().run_in_executor(pool, dl)
             if vdata:
                 await bot.send_video(chat_id=CHAT_ID, video=vdata, caption=cap, supports_streaming=True)
@@ -119,7 +136,6 @@ async def send(tid, text, ts, username, photo, has_vid):
     except Exception as e:
         log.error(f"❌ @{username}: {e}")
 
-# ── Check user ────────────────────────────────────────────────────────────────
 async def check(username):
     tweets = await get_tweets(username)
     new = 0
@@ -134,14 +150,12 @@ async def check(username):
             new += 1
             await asyncio.sleep(1)
         except Exception as e:
-            log.error(f"❌ parse @{username}: {e}")
+            log.error(f"❌ @{username} tweet: {e}")
     log.info(f"📨 @{username}: {new} new!" if new else f"😴 @{username}: no new")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
-    log.info(f"🚀 Bot starting | {len(USERNAMES)} accounts | {POLL}s poll")
+    log.info(f"🚀 Bot | {len(USERNAMES)} accounts | {POLL}s")
     await init()
-
     log.info("🌱 Seeding...")
     for u in USERNAMES:
         try:
@@ -155,8 +169,7 @@ async def main():
         except Exception as e:
             log.warning(f"Seed @{u}: {e}")
         await asyncio.sleep(1)
-
-    log.info(f"✅ Watching!\n")
+    log.info("✅ Watching!\n")
     while True:
         for u in USERNAMES:
             await check(u)
