@@ -143,20 +143,33 @@ async def send_to_telegram(entry, username: str):
         log.error(f"❌ Send failed @{username}: {e}")
 
 # ── Check one user ────────────────────────────────────────────────────────────
+def normalize_id(url: str) -> str:
+    """Remove #m and other fragments, extract tweet ID"""
+    if not url:
+        return ""
+    # Remove fragment (#m, #s etc)
+    url = url.split("#")[0].strip()
+    # Extract tweet ID from URL for most reliable dedup
+    match = re.search(r'/status/(\d+)', url)
+    if match:
+        return match.group(1)
+    return url
+
 async def check_user(username: str):
     try:
         entries = await fetch_tweets(username)
         new_count = 0
         for entry in reversed(entries):
-            # Use link as unique ID (most reliable)
-            uid = entry.get("link") or entry.get("id")
+            raw_uid = entry.get("link") or entry.get("id") or ""
+            uid = normalize_id(raw_uid)
             if not uid or uid in seen_ids:
                 continue
             if not INCLUDE_RETWEETS and "RT by" in entry.get("title", ""):
                 seen_ids.add(uid)
                 continue
-            await send_to_telegram(entry, username)
+            # Add to seen BEFORE sending to prevent duplicates in parallel
             seen_ids.add(uid)
+            await send_to_telegram(entry, username)
             new_count += 1
             await asyncio.sleep(1)
         if new_count:
@@ -180,7 +193,8 @@ async def run():
             log.warning(f"⚠️ Seed failed @{username}: {result}")
         else:
             for e in result:
-                uid = e.get("link") or e.get("id")
+                raw = e.get("link") or e.get("id") or ""
+                uid = normalize_id(raw)
                 if uid:
                     seen_ids.add(uid)
             log.info(f"✓ @{username} seeded {len(result)}")
