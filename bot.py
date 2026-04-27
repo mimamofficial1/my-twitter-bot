@@ -1,203 +1,202 @@
-import asyncio, os, logging, re, json, tempfile
-from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor
-import telegram, yt_dlp
+import os
+import time
+import logging
+import requests
+import feedparser
+from datetime import datetime
+from bs4 import BeautifulSoup
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
-log = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# ── Patch twikit User to fix 'urls' crash ─────────────────────────────────────
-import twikit.user as _um
-_orig = _um.User.__init__
-def _safe(self, client, data, *args, **kwargs):
-    try:
-        leg = data.get('legacy', {})
-        if isinstance(leg, dict):
-            ent = leg.setdefault('entities', {})
-            ent.setdefault('description', {}).setdefault('urls', [])
-            leg.setdefault('pinned_tweet_ids_str', [])
-            for f in ('possibly_sensitive','can_dm','can_media_tag','want_retweets','has_custom_timelines'):
-                leg.setdefault(f, False)
-    except: pass
-    try:
-        _orig(self, client, data, *args, **kwargs)
-    except Exception as e:
-        leg = data.get('legacy', {}) if isinstance(data, dict) else {}
-        self.id = data.get('rest_id', '') if isinstance(data, dict) else ''
-        self.name = leg.get('name', '')
-        self.screen_name = leg.get('screen_name', '')
-        self._client = client
-_um.User.__init__ = _safe
+# ─── CONFIG (Railway Environment Variables se aayega) ───────────────────────
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
+TWITTER_USERNAMES  = os.environ.get("TWITTER_USERNAMES", "").split(",")
+CHECK_INTERVAL     = int(os.environ.get("CHECK_INTERVAL", "120"))  # seconds
 
-import twikit
+# Nitter instances (fallback chain)
+NITTER_INSTANCES = [
+    "https://nitter.privacyredirect.com",
+    "https://nitter.poast.org",
+    "https://nitter.net",
+    "https://nitter.1d4.us",
+    "https://nitter.kavin.rocks",
+]
 
-def env(k):
-    v = os.environ.get(k)
-    if not v: raise EnvironmentError(f"Missing: {k}")
-    return v
+# ─── STATE (seen tweet IDs store karta hai) ──────────────────────────────────
+seen_ids: set = set()
 
-BOT_TOKEN    = env("TELEGRAM_BOT_TOKEN")
-CHAT_ID      = env("TELEGRAM_CHAT_ID")
-USERNAMES    = [u.strip().lstrip("@") for u in env("TWITTER_USERNAMES").split(",") if u.strip()]
-COOKIES_JSON = env("TWITTER_COOKIES")
-POLL         = max(60, int(os.environ.get("POLL_INTERVAL_SECONDS", "120")))
-SKIP_RT      = os.environ.get("INCLUDE_RETWEETS", "false").lower() != "true"
-PREFIX       = os.environ.get("CUSTOM_PREFIX", "🐦 New Tweet")
 
-seen: set = set()
-pool = ThreadPoolExecutor(max_workers=4)
-client: twikit.Client = None
-user_cache: dict = {}  # username → user object (cache to save API calls)
-
-async def init():
-    global client
-    raw = json.loads(COOKIES_JSON)
-    cdict = {c["name"]: c["value"] for c in raw} if isinstance(raw, list) else raw
-    with open("/tmp/ck.json", "w") as f: json.dump(cdict, f)
-    client = twikit.Client(language="en-US")
-    client.load_cookies("/tmp/ck.json")
-    log.info(f"✅ {len(cdict)} cookies loaded")
-
-async def get_user(username):
-    """Get user with caching — saves 1 API call per account per cycle"""
-    if username not in user_cache:
-        user_cache[username] = await client.get_user_by_screen_name(username)
-        log.info(f"📦 Cached @{username}")
-        await asyncio.sleep(2)  # small delay after getting user
-    return user_cache[username]
-
-async def get_tweets(username):
-    for attempt in range(3):
+def get_nitter_rss(username: str) -> feedparser.FeedDict | None:
+    """Try each Nitter instance until one works."""
+    for instance in NITTER_INSTANCES:
+        url = f"{instance}/{username}/rss"
         try:
-            user = await get_user(username)
-            tweets = list(await user.get_tweets("Tweets", count=10))
-            return tweets
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200 and "<rss" in resp.text:
+                feed = feedparser.parse(resp.text)
+                if feed.entries:
+                    logger.info(f"✅ {instance} worked for @{username}")
+                    return feed
         except Exception as e:
-            err = str(e)
-            if '429' in err or 'Rate limit' in err:
-                wait = 60 * (attempt + 1)  # 60s, 120s, 180s
-                log.warning(f"⏳ Rate limit @{username} — waiting {wait}s...")
-                await asyncio.sleep(wait)
-                # Clear user cache on rate limit so fresh fetch next time
-                user_cache.pop(username, None)
-            else:
-                log.error(f"❌ @{username}: {e}")
-                return []
-    return []
+            logger.warning(f"❌ {instance} failed: {e}")
+    logger.error(f"All Nitter instances failed for @{username}")
+    return None
 
-def parse(tw):
-    tid = str(getattr(tw, "id", "") or "")
-    text = ""
-    for a in ("full_text", "text"):
-        try:
-            v = getattr(tw, a, None)
-            if isinstance(v, str) and v:
-                text = v; break
-        except: pass
-    text = re.sub(r"https://t\.co/\S+", "", text).strip()
 
-    ts = ""
+def extract_image(entry) -> str | None:
+    """RSS entry se pehli image URL nikaalte hain."""
+    # 1) media:content tag
+    if hasattr(entry, "media_content") and entry.media_content:
+        url = entry.media_content[0].get("url", "")
+        if url:
+            return url
+
+    # 2) HTML summary mein <img> tag
+    summary = entry.get("summary", "")
+    if summary:
+        soup = BeautifulSoup(summary, "html.parser")
+        img = soup.find("img")
+        if img and img.get("src"):
+            src = img["src"]
+            # Nitter relative URLs fix karo
+            if src.startswith("/pic/"):
+                src = f"https://nitter.privacyredirect.com{src}"
+            return src
+
+    return None
+
+
+def clean_text(html: str) -> str:
+    """HTML strip karke plain text."""
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(separator=" ").strip()
+
+
+def send_telegram_photo(image_url: str, caption: str):
+    """Image + caption Telegram pe bhejo."""
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "photo": image_url,
+        "caption": caption,
+        "parse_mode": "HTML",
+    }
+    resp = requests.post(api, json=payload, timeout=15)
+    if not resp.ok:
+        logger.warning(f"sendPhoto failed ({resp.status_code}), falling back to text")
+        send_telegram_text(caption)
+
+
+def send_telegram_text(text: str):
+    """Sirf text Telegram pe bhejo."""
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    resp = requests.post(api, json=payload, timeout=15)
+    if not resp.ok:
+        logger.error(f"sendMessage failed: {resp.status_code} {resp.text}")
+
+
+def format_caption(username: str, entry) -> str:
+    """Caption banao: username + time + tweet text + link."""
+    tweet_text = clean_text(entry.get("summary", ""))
+    # Nitter links ko twitter.com pe redirect karo
+    link = entry.get("link", "").replace("nitter.privacyredirect.com", "twitter.com") \
+                                .replace("nitter.poast.org", "twitter.com") \
+                                .replace("nitter.net", "twitter.com") \
+                                .replace("nitter.1d4.us", "twitter.com") \
+                                .replace("nitter.kavin.rocks", "twitter.com")
+
+    published = entry.get("published", "")
     try:
-        ca = str(getattr(tw, "created_at", "") or "")
-        dt = datetime.strptime(ca, "%a %b %d %H:%M:%S +0000 %Y")
-        ts = (dt + timedelta(hours=5, minutes=30)).strftime("%d %b %Y, %I:%M %p IST")
-    except: pass
+        dt = datetime(*entry.published_parsed[:6])
+        time_str = dt.strftime("%d %b %Y, %I:%M %p")
+    except Exception:
+        time_str = published
 
-    photo, has_vid = None, False
-    try:
-        for m in (getattr(tw, "media", None) or []):
-            mt = getattr(m, "type", "") if hasattr(m, "type") else m.get("type","")
-            if mt == "photo" and not photo:
-                photo = getattr(m, "media_url_https", None) or (m.get("media_url_https") if isinstance(m,dict) else None)
-            elif mt in ("video", "animated_gif"):
-                has_vid = True
-    except: pass
+    caption = (
+        f"🐦 <b>@{username}</b>\n"
+        f"🕐 {time_str}\n\n"
+        f"{tweet_text}\n\n"
+        f"🔗 <a href='{link}'>Tweet dekho</a>"
+    )
+    return caption
 
-    is_rt = bool(getattr(tw, "retweeted_tweet", None)) or text.startswith("RT @")
-    return tid, text, ts, photo, has_vid, is_rt
 
-async def send(tid, text, ts, username, photo, has_vid):
-    bot = telegram.Bot(token=BOT_TOKEN)
-    url = f"https://twitter.com/{username}/status/{tid}"
-    cap = f"{PREFIX}\n\n👤 @{username}\n🕐 {ts}\n\n{text}\n\nView on X: {url}"
+def process_feed(username: str):
+    """Ek user ke naye tweets fetch karke Telegram pe bhejo."""
+    feed = get_nitter_rss(username)
+    if not feed:
+        return
 
-    if has_vid:
-        try:
-            def dl():
-                with tempfile.TemporaryDirectory() as d:
-                    with yt_dlp.YoutubeDL({"outtmpl":f"{d}/v.%(ext)s","format":"best[filesize<50M]/best","quiet":True}) as y:
-                        y.extract_info(url, download=True)
-                    fs = os.listdir(d)
-                    return open(f"{d}/{fs[0]}","rb").read() if fs else None
-            vdata = await asyncio.get_event_loop().run_in_executor(pool, dl)
-            if vdata:
-                await bot.send_video(chat_id=CHAT_ID, video=vdata, caption=cap, supports_streaming=True)
-                log.info(f"✅ Video @{username}"); return
-        except Exception as e: log.warning(f"Video: {e}")
+    new_tweets = []
+    for entry in feed.entries:
+        tweet_id = entry.get("id", entry.get("link", ""))
+        if tweet_id and tweet_id not in seen_ids:
+            new_tweets.append((tweet_id, entry))
 
-    if photo:
-        try:
-            await bot.send_photo(chat_id=CHAT_ID, photo=photo, caption=cap)
-            log.info(f"✅ Photo @{username}"); return
-        except Exception as e: log.warning(f"Photo: {e}")
+    # Reverse karo taaki purane pehle aayein
+    for tweet_id, entry in reversed(new_tweets):
+        seen_ids.add(tweet_id)
+        caption = format_caption(username, entry)
+        image_url = extract_image(entry)
 
-    try:
-        await bot.send_message(chat_id=CHAT_ID, text=cap, disable_web_page_preview=False)
-        log.info(f"✅ Text @{username}")
-    except Exception as e: log.error(f"❌ @{username}: {e}")
+        if image_url:
+            logger.info(f"📸 Sending photo tweet from @{username}")
+            send_telegram_photo(image_url, caption)
+        else:
+            logger.info(f"📝 Sending text tweet from @{username}")
+            send_telegram_text(caption)
 
-async def check(username):
-    tweets = await get_tweets(username)
-    new = 0
-    for tw in reversed(tweets):
-        try:
-            tid, text, ts, photo, has_vid, is_rt = parse(tw)
-            if not tid or tid in seen: continue
-            if SKIP_RT and is_rt:
-                seen.add(tid); continue
-            seen.add(tid)
-            await send(tid, text, ts, username, photo, has_vid)
-            new += 1
-            await asyncio.sleep(1)
-        except Exception as e:
-            log.error(f"❌ @{username} tweet: {e}")
-    log.info(f"📨 @{username}: {new} new!" if new else f"😴 @{username}: no new")
+        time.sleep(1)  # Rate limit avoid
 
-async def main():
-    log.info(f"🚀 Bot | {len(USERNAMES)} accounts | {POLL}s poll")
-    await init()
 
-    # Cache all users upfront with delays to avoid rate limit
-    log.info("📦 Caching users...")
-    for u in USERNAMES:
-        try:
-            await get_user(u)
-        except Exception as e:
-            log.warning(f"Cache @{u}: {e}")
-        await asyncio.sleep(3)
+def initialize():
+    """Pehli run pe purane tweets mark karo (bhejo nahi)."""
+    logger.info("🚀 Bot start ho raha hai — purane tweets skip kar raha hoon...")
+    for username in TWITTER_USERNAMES:
+        username = username.strip()
+        if not username:
+            continue
+        feed = get_nitter_rss(username)
+        if feed:
+            for entry in feed.entries:
+                tweet_id = entry.get("id", entry.get("link", ""))
+                if tweet_id:
+                    seen_ids.add(tweet_id)
+            logger.info(f"✅ @{username} — {len(feed.entries)} purane tweets skip kiye")
 
-    # Seed
-    log.info("🌱 Seeding...")
-    for u in USERNAMES:
-        try:
-            tws = await get_tweets(u)
-            for t in tws:
-                try:
-                    tid, *_ = parse(t)
-                    if tid: seen.add(tid)
-                except: pass
-            log.info(f"✓ @{u} seeded {len(tws)}")
-        except Exception as e:
-            log.warning(f"Seed @{u}: {e}")
-        await asyncio.sleep(5)  # 5s between each account during seeding
 
-    log.info("✅ Watching!\n")
+def main():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("❌ TELEGRAM_BOT_TOKEN aur TELEGRAM_CHAT_ID set karo!")
+        return
+
+    if not any(u.strip() for u in TWITTER_USERNAMES):
+        logger.error("❌ TWITTER_USERNAMES set karo!")
+        return
+
+    initialize()
+
+    logger.info(f"👀 Monitoring: {', '.join('@' + u.strip() for u in TWITTER_USERNAMES)}")
+    logger.info(f"⏱️ Har {CHECK_INTERVAL} seconds pe check karega")
+
     while True:
-        for u in USERNAMES:
-            await check(u)
-            await asyncio.sleep(5)  # 5s between each account
-        log.info(f"💤 {POLL}s...")
-        await asyncio.sleep(POLL)
+        for username in TWITTER_USERNAMES:
+            username = username.strip()
+            if username:
+                process_feed(username)
+        time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
