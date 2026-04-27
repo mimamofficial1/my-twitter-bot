@@ -6,35 +6,39 @@ import telegram, yt_dlp
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.StreamHandler()])
 log = logging.getLogger(__name__)
 
-# ── Patch twikit BEFORE importing to fix 'urls' crash ─────────────────────────
-import twikit.tweet as _tw_module
-_orig_tweet_init = _tw_module.Tweet.__init__
+# ── Patch twikit User.__init__ to fix 'urls' and 'pinned_tweet_ids_str' crash ─
+import twikit.user as _user_mod
+_orig_user_init = _user_mod.User.__init__
 
-def _safe_tweet_init(self, client, data, *args, **kwargs):
+def _safe_user_init(self, client, data, *args, **kwargs):
     try:
-        # Sanitize URLs in entities to prevent crash
-        if isinstance(data, dict):
-            for key in ('entities', 'legacy'):
-                d = data.get(key, {})
-                if isinstance(d, dict) and 'urls' in d:
-                    urls = d['urls']
-                    if isinstance(urls, list):
-                        d['urls'] = [u for u in urls if isinstance(u, dict) and 'url' in u]
+        # Fix missing keys in legacy before twikit processes them
+        legacy = data.get('legacy', {})
+        if isinstance(legacy, dict):
+            # Fix description urls
+            entities = legacy.setdefault('entities', {})
+            desc = entities.setdefault('description', {})
+            desc.setdefault('urls', [])
+            # Fix pinned_tweet_ids_str
+            legacy.setdefault('pinned_tweet_ids_str', [])
+            # Fix other optional fields
+            for field in ('possibly_sensitive', 'can_dm', 'can_media_tag',
+                         'want_retweets', 'has_custom_timelines'):
+                legacy.setdefault(field, False)
     except Exception:
         pass
     try:
-        _orig_tweet_init(self, client, data, *args, **kwargs)
+        _orig_user_init(self, client, data, *args, **kwargs)
     except Exception as e:
-        # Still construct a minimal usable object
-        self.id = data.get('id_str') or data.get('rest_id') or ''
-        self.text = data.get('full_text') or data.get('text') or ''
-        self.created_at = data.get('created_at') or ''
-        self.media = []
-        self.urls = []
-        self.retweeted_tweet = None
-        log.warning(f"Tweet init patched: {e}")
+        # Minimal user object
+        legacy = data.get('legacy', {}) if isinstance(data, dict) else {}
+        self.id = data.get('rest_id', '') if isinstance(data, dict) else ''
+        self.name = legacy.get('name', '')
+        self.screen_name = legacy.get('screen_name', '')
+        self._client = client
+        log.warning(f"User init patched: {e}")
 
-_tw_module.Tweet.__init__ = _safe_tweet_init
+_user_mod.User.__init__ = _safe_user_init
 
 import twikit
 
@@ -73,7 +77,7 @@ async def get_tweets(username):
         return []
 
 def parse(tw):
-    tid  = str(getattr(tw, "id", "") or "")
+    tid = str(getattr(tw, "id", "") or "")
     text = ""
     for a in ("full_text", "text"):
         try:
