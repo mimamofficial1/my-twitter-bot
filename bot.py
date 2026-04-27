@@ -19,8 +19,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TWITTER_USERNAMES  = [u.strip() for u in os.environ.get("TWITTER_USERNAMES", "").split(",") if u.strip()]
 TW_USERNAME        = os.environ.get("TW_USERNAME", "")
-TW_PASSWORD        = os.environ.get("TW_PASSWORD", "")
 TW_EMAIL           = os.environ.get("TW_EMAIL", "")
+TW_AUTH_TOKEN      = os.environ.get("TW_AUTH_TOKEN", "")
+TW_CT0             = os.environ.get("TW_CT0", "")
 SEEN_IDS_FILE      = "seen_ids.json"
 
 # ─── SEEN IDs ─────────────────────────────────────────────────────────────────
@@ -59,7 +60,6 @@ def send_telegram_text(text: str):
         logger.error(f"sendMessage failed: {resp.status_code} {resp.text}")
 
 def send_status(new_count: int, checked: int, errors: int):
-    """Har run ke baad status message bhejo."""
     now = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")
     if new_count > 0:
         status_icon = "🟢"
@@ -105,25 +105,32 @@ def get_best_image(tweet) -> str:
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_PASSWORD, TW_EMAIL]):
-        logger.error("❌ Env variables missing!")
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_AUTH_TOKEN, TW_CT0]):
+        logger.error("❌ Env variables missing! Chahiye: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_AUTH_TOKEN, TW_CT0")
         return
 
     seen_ids = load_seen_ids()
     logger.info(f"📂 {len(seen_ids)} seen IDs loaded")
 
     api = API()
+
+    # Cookie-based login — password ki zaroorat nahi!
     accounts = await api.pool.get_all()
     if not accounts:
-        logger.info("🔑 Twitter account add kar raha hoon...")
-        await api.pool.add_account(TW_USERNAME, TW_PASSWORD, TW_EMAIL, "")
-        await api.pool.login_all()
-        logger.info("✅ Login successful!")
+        logger.info("🍪 Cookie se login kar raha hoon...")
+        await api.pool.add_account(
+            username=TW_USERNAME,
+            password="dummy_not_needed",
+            email=TW_EMAIL or f"{TW_USERNAME}@dummy.com",
+            email_password="",
+            cookies=f"auth_token={TW_AUTH_TOKEN}; ct0={TW_CT0}",
+        )
+        logger.info("✅ Cookie login successful!")
     else:
         logger.info(f"✅ Account ready: {accounts[0].username}")
 
-    new_count  = 0
-    checked    = 0
+    new_count   = 0
+    checked     = 0
     error_count = 0
 
     for username in TWITTER_USERNAMES:
@@ -162,8 +169,6 @@ async def main():
 
     save_seen_ids(seen_ids)
     logger.info(f"✅ Done! {new_count} naye tweets. {len(seen_ids)} total seen.")
-
-    # Status message Telegram pe bhejo
     send_status(new_count, checked, error_count)
 
 if __name__ == "__main__":
