@@ -3,29 +3,24 @@ import json
 import asyncio
 import logging
 import requests
+import instaloader
 from datetime import datetime, timezone
-from twscrape import API, gather
-from twscrape.logger import set_log_level
+from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
-set_log_level("ERROR")
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
-TWITTER_USERNAMES  = [u.strip() for u in os.environ.get("TWITTER_USERNAMES", "").split(",") if u.strip()]
-TW_USERNAME        = os.environ.get("TW_USERNAME", "")
-TW_EMAIL           = os.environ.get("TW_EMAIL", "")
-TW_AUTH_TOKEN      = os.environ.get("TW_AUTH_TOKEN", "")
-TW_CT0             = os.environ.get("TW_CT0", "")
+IG_USERNAMES       = [u.strip() for u in os.environ.get("IG_USERNAMES", "").split(",") if u.strip()]
+IG_USERNAME        = os.environ.get("IG_USERNAME", "")   # Apna Instagram account
+IG_PASSWORD        = os.environ.get("IG_PASSWORD", "")   # Apna Instagram password
 SEEN_IDS_FILE      = "seen_ids.json"
-
-PER_USER_TIMEOUT   = 30   # max 30 seconds per user
-TOTAL_TIMEOUT      = 300  # max 5 minutes total
+MAX_POSTS          = 5   # Har account ke latest kitne posts check karein
 
 # ─── SEEN IDs ─────────────────────────────────────────────────────────────────
 def load_seen_ids() -> set:
@@ -39,18 +34,56 @@ def save_seen_ids(seen: set):
         json.dump(list(seen), f)
 
 # ─── TELEGRAM ─────────────────────────────────────────────────────────────────
-def send_telegram_photo(image_url: str, caption: str):
+def send_photo(image_url: str, caption: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
     resp = requests.post(api, json={
         "chat_id": TELEGRAM_CHAT_ID,
         "photo": image_url,
         "caption": caption[:1024],
         "parse_mode": "HTML",
-    }, timeout=15)
+    }, timeout=20)
     if not resp.ok:
-        send_telegram_text(caption)
+        logger.warning(f"sendPhoto failed: {resp.status_code}")
+        send_text(caption)
 
-def send_telegram_text(text: str):
+def send_media_group(media_urls: list, caption: str):
+    """Album — multiple images ek saath bhejo."""
+    if not media_urls:
+        return
+    if len(media_urls) == 1:
+        send_photo(media_urls[0], caption)
+        return
+
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMediaGroup"
+    media = []
+    for i, url in enumerate(media_urls[:10]):  # Max 10 images
+        item = {"type": "photo", "media": url}
+        if i == 0:
+            item["caption"] = caption[:1024]
+            item["parse_mode"] = "HTML"
+        media.append(item)
+
+    resp = requests.post(api, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "media": media,
+    }, timeout=30)
+
+    if not resp.ok:
+        logger.warning(f"sendMediaGroup failed: {resp.status_code} — single photo try kar raha hoon")
+        send_photo(media_urls[0], caption)
+
+def send_video(video_url: str, caption: str):
+    api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+    resp = requests.post(api, json={
+        "chat_id": TELEGRAM_CHAT_ID,
+        "video": video_url,
+        "caption": caption[:1024],
+        "parse_mode": "HTML",
+    }, timeout=30)
+    if not resp.ok:
+        send_text(caption)
+
+def send_text(text: str):
     api = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     resp = requests.post(api, json={
         "chat_id": TELEGRAM_CHAT_ID,
@@ -59,136 +92,164 @@ def send_telegram_text(text: str):
         "disable_web_page_preview": False,
     }, timeout=15)
     if not resp.ok:
-        logger.error(f"sendMessage failed: {resp.status_code} {resp.text}")
+        logger.error(f"sendMessage failed: {resp.status_code}")
 
 def send_status(new_count: int, checked: int, errors: int):
     now = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")
     icon = "🟢" if new_count > 0 else "🔵"
-    tweet_line = f"📨 <b>{new_count}</b> naye tweets forward kiye" if new_count > 0 else "💤 Koi naya tweet nahi mila"
+    post_line = f"📨 <b>{new_count}</b> naye posts forward kiye" if new_count > 0 else "💤 Koi naya post nahi mila"
     msg = (
         f"{icon} <b>Bot Status — Active</b>\n"
         f"🕐 {now}\n"
         f"━━━━━━━━━━━━━━\n"
-        f"{tweet_line}\n"
+        f"{post_line}\n"
+        f"📸 Instagram → Telegram\n"
         f"👀 {checked} accounts check kiye\n"
         f"❌ {errors} errors\n"
         f"⏭️ Agla run ~15 min mein"
     )
-    send_telegram_text(msg)
+    send_text(msg)
 
-def format_caption(tweet) -> str:
-    username = tweet.user.username
-    name     = tweet.user.displayname
-    text     = tweet.rawContent or ""
-    link     = f"https://twitter.com/{username}/status/{tweet.id}"
+def format_caption(username: str, post) -> str:
+    caption_text = post.caption or ""
+    # Caption 500 chars tak
+    if len(caption_text) > 500:
+        caption_text = caption_text[:500] + "..."
+
     try:
-        time_str = tweet.date.strftime("%d %b %Y, %I:%M %p UTC")
+        time_str = post.date_utc.strftime("%d %b %Y, %I:%M %p UTC")
     except Exception:
         time_str = ""
+
+    post_url = f"https://www.instagram.com/p/{post.shortcode}/"
+
     return (
-        f"🐦 <b>{name}</b> (@{username})\n"
+        f"📸 <b>@{username}</b>\n"
         f"🕐 {time_str}\n\n"
-        f"{text}\n\n"
-        f"🔗 <a href='{link}'>Tweet dekho</a>"
+        f"{caption_text}\n\n"
+        f"🔗 <a href='{post_url}'>Instagram pe dekho</a>"
     )
 
-def get_best_image(tweet) -> str:
+# ─── INSTAGRAM ────────────────────────────────────────────────────────────────
+def process_account(loader: instaloader.Instaloader, username: str, seen_ids: set) -> tuple:
+    """Ek Instagram account ke naye posts fetch karo."""
+    new_count = 0
     try:
-        if tweet.media and tweet.media.photos:
-            return tweet.media.photos[0].url
-    except Exception:
-        pass
-    return ""
+        profile = instaloader.Profile.from_username(loader.context, username)
+        posts = []
 
-# ─── FETCH WITH TIMEOUT ───────────────────────────────────────────────────────
-async def fetch_user(api: API, username: str, seen_ids: set) -> tuple:
-    """Returns (new_count, success)"""
-    try:
-        user = await asyncio.wait_for(api.user_by_login(username), timeout=PER_USER_TIMEOUT)
-        if not user:
-            logger.error(f"❌ Not found: @{username}")
-            return 0, False
+        for post in profile.get_posts():
+            if len(posts) >= MAX_POSTS:
+                break
+            posts.append(post)
 
-        tweets = await asyncio.wait_for(
-            gather(api.user_tweets(user.id, limit=10)),
-            timeout=PER_USER_TIMEOUT
-        )
+        # Reverse karo — purane pehle
+        for post in reversed(posts):
+            post_id = str(post.mediaid)
+            if post_id in seen_ids:
+                continue
 
-        new_tweets = [t for t in tweets if t.id not in seen_ids]
-        count = 0
+            seen_ids.add(post_id)
+            caption = format_caption(username, post)
 
-        for tweet in reversed(new_tweets):
-            seen_ids.add(tweet.id)
-            caption   = format_caption(tweet)
-            image_url = get_best_image(tweet)
+            try:
+                if post.typename == "GraphSidecar":
+                    # Album post — saari images nikalo
+                    media_urls = []
+                    for node in post.get_sidecar_nodes():
+                        if node.is_video:
+                            # Video node — skip ya alag bhejo
+                            pass
+                        else:
+                            media_urls.append(node.display_url)
 
-            if image_url:
-                logger.info(f"📸 @{username}")
-                send_telegram_photo(image_url, caption)
-            else:
-                logger.info(f"📝 @{username}")
-                send_telegram_text(caption)
+                    if media_urls:
+                        logger.info(f"🖼️ Album ({len(media_urls)} images) @{username}")
+                        send_media_group(media_urls, caption)
+                    else:
+                        send_text(caption)
 
-            count += 1
-            await asyncio.sleep(0.5)
+                elif post.is_video:
+                    logger.info(f"🎥 Video @{username}")
+                    send_video(post.video_url, caption)
 
-        logger.info(f"✅ @{username} — {count} naye tweets")
-        return count, True
+                else:
+                    # Single image
+                    logger.info(f"📸 Photo @{username}")
+                    send_photo(post.url, caption)
 
-    except asyncio.TimeoutError:
-        logger.error(f"⏰ Timeout: @{username} — skip kar raha hoon")
+                new_count += 1
+                import time
+                time.sleep(2)  # Telegram rate limit
+
+            except Exception as e:
+                logger.error(f"❌ Post send error @{username}: {e}")
+
+        return new_count, True
+
+    except instaloader.exceptions.ProfileNotExistsException:
+        logger.error(f"❌ Profile not found: @{username}")
+        return 0, False
+    except instaloader.exceptions.LoginRequiredException:
+        logger.error(f"❌ Login required for @{username}")
         return 0, False
     except Exception as e:
         logger.error(f"❌ Error @{username}: {e}")
         return 0, False
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
-async def main():
-    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_AUTH_TOKEN, TW_CT0]):
-        logger.error("❌ Env variables missing!")
+def main():
+    if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
+        logger.error("❌ TELEGRAM_BOT_TOKEN aur TELEGRAM_CHAT_ID set karo!")
+        return
+
+    if not IG_USERNAMES:
+        logger.error("❌ IG_USERNAMES set karo!")
         return
 
     seen_ids = load_seen_ids()
     logger.info(f"📂 {len(seen_ids)} seen IDs loaded")
 
-    api = API()
-    accounts = await api.pool.get_all()
-    if not accounts:
-        logger.info("🍪 Cookie se login kar raha hoon...")
-        await api.pool.add_account(
-            username=TW_USERNAME,
-            password="dummy_not_needed",
-            email=TW_EMAIL or f"{TW_USERNAME}@dummy.com",
-            email_password="",
-            cookies=f"auth_token={TW_AUTH_TOKEN}; ct0={TW_CT0}",
-        )
-        logger.info("✅ Cookie login successful!")
-    else:
-        logger.info(f"✅ Account ready: {accounts[0].username}")
+    # Instaloader setup
+    loader = instaloader.Instaloader(
+        download_pictures=False,
+        download_videos=False,
+        download_video_thumbnails=False,
+        download_geotags=False,
+        download_comments=False,
+        save_metadata=False,
+        compress_json=False,
+        quiet=True,
+    )
 
-    new_count   = 0
+    # Login karo agar credentials hain
+    if IG_USERNAME and IG_PASSWORD:
+        try:
+            loader.login(IG_USERNAME, IG_PASSWORD)
+            logger.info(f"✅ Instagram login: @{IG_USERNAME}")
+        except Exception as e:
+            logger.warning(f"⚠️ Login failed: {e} — bina login ke try kar raha hoon")
+    else:
+        logger.info("ℹ️ Bina login ke chal raha hoon (sirf public accounts)")
+
+    new_total   = 0
     checked     = 0
     error_count = 0
 
-    async def run_all():
-        nonlocal new_count, checked, error_count
-        for username in TWITTER_USERNAMES:
-            count, success = await fetch_user(api, username, seen_ids)
-            new_count += count
-            if success:
-                checked += 1
-            else:
-                error_count += 1
-            await asyncio.sleep(1)
-
-    try:
-        await asyncio.wait_for(run_all(), timeout=TOTAL_TIMEOUT)
-    except asyncio.TimeoutError:
-        logger.error("⏰ Total timeout — 5 min limit reached!")
+    for username in IG_USERNAMES:
+        logger.info(f"🔍 Checking @{username}...")
+        count, success = process_account(loader, username, seen_ids)
+        new_total += count
+        if success:
+            checked += 1
+        else:
+            error_count += 1
+        import time
+        time.sleep(3)  # Instagram rate limit avoid
 
     save_seen_ids(seen_ids)
-    logger.info(f"✅ Done! {new_count} naye tweets. {len(seen_ids)} total seen.")
-    send_status(new_count, checked, error_count)
+    logger.info(f"✅ Done! {new_total} naye posts. {len(seen_ids)} total seen.")
+    send_status(new_total, checked, error_count)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
