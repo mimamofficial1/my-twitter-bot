@@ -1,2 +1,2 @@
-twscrape==0.17.0
+instaloader==4.13.1
 requests==2.31.0
