@@ -2,8 +2,8 @@ name: Twitter to Telegram Bot
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # Har 15 minute mein run karega
-  workflow_dispatch:           # Manual run bhi kar sakte ho
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -42,15 +42,15 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           TWITTER_USERNAMES: ${{ secrets.TWITTER_USERNAMES }}
           TW_USERNAME: ${{ secrets.TW_USERNAME }}
-          TW_PASSWORD: ${{ secrets.TW_PASSWORD }}
           TW_EMAIL: ${{ secrets.TW_EMAIL }}
+          TW_AUTH_TOKEN: ${{ secrets.TW_AUTH_TOKEN }}
+          TW_CT0: ${{ secrets.TW_CT0 }}
         run: python bot.py
 
       - name: Save seen_ids to repo
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # seen_ids.json nahi hai toh empty file banao
           [ -f seen_ids.json ] || echo "[]" > seen_ids.json
           git add seen_ids.json
           git diff --staged --quiet || git commit -m "Update seen_ids [skip ci]"
