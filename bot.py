@@ -24,6 +24,9 @@ TW_AUTH_TOKEN      = os.environ.get("TW_AUTH_TOKEN", "")
 TW_CT0             = os.environ.get("TW_CT0", "")
 SEEN_IDS_FILE      = "seen_ids.json"
 
+PER_USER_TIMEOUT   = 30   # max 30 seconds per user
+TOTAL_TIMEOUT      = 300  # max 5 minutes total
+
 # ─── SEEN IDs ─────────────────────────────────────────────────────────────────
 def load_seen_ids() -> set:
     if os.path.exists(SEEN_IDS_FILE):
@@ -45,7 +48,6 @@ def send_telegram_photo(image_url: str, caption: str):
         "parse_mode": "HTML",
     }, timeout=15)
     if not resp.ok:
-        logger.warning(f"sendPhoto failed, trying text...")
         send_telegram_text(caption)
 
 def send_telegram_text(text: str):
@@ -61,15 +63,10 @@ def send_telegram_text(text: str):
 
 def send_status(new_count: int, checked: int, errors: int):
     now = datetime.now(timezone.utc).strftime("%d %b %Y, %I:%M %p UTC")
-    if new_count > 0:
-        status_icon = "🟢"
-        tweet_line  = f"📨 <b>{new_count}</b> naye tweets forward kiye"
-    else:
-        status_icon = "🔵"
-        tweet_line  = "💤 Koi naya tweet nahi mila"
-
+    icon = "🟢" if new_count > 0 else "🔵"
+    tweet_line = f"📨 <b>{new_count}</b> naye tweets forward kiye" if new_count > 0 else "💤 Koi naya tweet nahi mila"
     msg = (
-        f"{status_icon} <b>Bot Status — Active</b>\n"
+        f"{icon} <b>Bot Status — Active</b>\n"
         f"🕐 {now}\n"
         f"━━━━━━━━━━━━━━\n"
         f"{tweet_line}\n"
@@ -103,18 +100,58 @@ def get_best_image(tweet) -> str:
         pass
     return ""
 
+# ─── FETCH WITH TIMEOUT ───────────────────────────────────────────────────────
+async def fetch_user(api: API, username: str, seen_ids: set) -> tuple:
+    """Returns (new_count, success)"""
+    try:
+        user = await asyncio.wait_for(api.user_by_login(username), timeout=PER_USER_TIMEOUT)
+        if not user:
+            logger.error(f"❌ Not found: @{username}")
+            return 0, False
+
+        tweets = await asyncio.wait_for(
+            gather(api.user_tweets(user.id, limit=10)),
+            timeout=PER_USER_TIMEOUT
+        )
+
+        new_tweets = [t for t in tweets if t.id not in seen_ids]
+        count = 0
+
+        for tweet in reversed(new_tweets):
+            seen_ids.add(tweet.id)
+            caption   = format_caption(tweet)
+            image_url = get_best_image(tweet)
+
+            if image_url:
+                logger.info(f"📸 @{username}")
+                send_telegram_photo(image_url, caption)
+            else:
+                logger.info(f"📝 @{username}")
+                send_telegram_text(caption)
+
+            count += 1
+            await asyncio.sleep(0.5)
+
+        logger.info(f"✅ @{username} — {count} naye tweets")
+        return count, True
+
+    except asyncio.TimeoutError:
+        logger.error(f"⏰ Timeout: @{username} — skip kar raha hoon")
+        return 0, False
+    except Exception as e:
+        logger.error(f"❌ Error @{username}: {e}")
+        return 0, False
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 async def main():
     if not all([TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_AUTH_TOKEN, TW_CT0]):
-        logger.error("❌ Env variables missing! Chahiye: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TW_USERNAME, TW_AUTH_TOKEN, TW_CT0")
+        logger.error("❌ Env variables missing!")
         return
 
     seen_ids = load_seen_ids()
     logger.info(f"📂 {len(seen_ids)} seen IDs loaded")
 
     api = API()
-
-    # Cookie-based login — password ki zaroorat nahi!
     accounts = await api.pool.get_all()
     if not accounts:
         logger.info("🍪 Cookie se login kar raha hoon...")
@@ -133,39 +170,21 @@ async def main():
     checked     = 0
     error_count = 0
 
-    for username in TWITTER_USERNAMES:
-        try:
-            user = await api.user_by_login(username)
-            if not user:
-                logger.error(f"❌ User not found: @{username}")
+    async def run_all():
+        nonlocal new_count, checked, error_count
+        for username in TWITTER_USERNAMES:
+            count, success = await fetch_user(api, username, seen_ids)
+            new_count += count
+            if success:
+                checked += 1
+            else:
                 error_count += 1
-                continue
+            await asyncio.sleep(1)
 
-            checked += 1
-            logger.info(f"🔍 Checking @{username}...")
-            tweets = await gather(api.user_tweets(user.id, limit=10))
-            new_tweets = [t for t in tweets if t.id not in seen_ids]
-
-            for tweet in reversed(new_tweets):
-                seen_ids.add(tweet.id)
-                caption   = format_caption(tweet)
-                image_url = get_best_image(tweet)
-
-                if image_url:
-                    logger.info(f"📸 Photo tweet @{username}")
-                    send_telegram_photo(image_url, caption)
-                else:
-                    logger.info(f"📝 Text tweet @{username}")
-                    send_telegram_text(caption)
-
-                new_count += 1
-                await asyncio.sleep(1)
-
-        except Exception as e:
-            logger.error(f"❌ Error for @{username}: {e}")
-            error_count += 1
-
-        await asyncio.sleep(2)
+    try:
+        await asyncio.wait_for(run_all(), timeout=TOTAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.error("⏰ Total timeout — 5 min limit reached!")
 
     save_seen_ids(seen_ids)
     logger.info(f"✅ Done! {new_count} naye tweets. {len(seen_ids)} total seen.")
