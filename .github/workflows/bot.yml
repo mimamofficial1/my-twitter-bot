@@ -1,4 +1,4 @@
-name: Twitter to Telegram Bot
+name: Instagram to Telegram Bot
 
 on:
   schedule:
@@ -37,17 +37,16 @@ jobs:
           restore-keys: seen-ids-
 
       - name: Run bot
+        timeout-minutes: 8
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TWITTER_USERNAMES: ${{ secrets.TWITTER_USERNAMES }}
-          TW_USERNAME: ${{ secrets.TW_USERNAME }}
-          TW_EMAIL: ${{ secrets.TW_EMAIL }}
-          TW_AUTH_TOKEN: ${{ secrets.TW_AUTH_TOKEN }}
-          TW_CT0: ${{ secrets.TW_CT0 }}
+          IG_USERNAMES: ${{ secrets.IG_USERNAMES }}
+          IG_USERNAME: ${{ secrets.IG_USERNAME }}
+          IG_PASSWORD: ${{ secrets.IG_PASSWORD }}
         run: python bot.py
 
-      - name: Save seen_ids to repo
+      - name: Save seen_ids
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
